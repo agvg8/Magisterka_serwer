@@ -12,6 +12,7 @@ Uruchomienie (patrz README.md):
 """
 
 import asyncio
+import json
 import os
 import socket
 import sqlite3
@@ -74,7 +75,8 @@ def init_db():
             caregiver_slots INTEGER NOT NULL DEFAULT 0,
             specialist_id TEXT,
             last_sync TEXT,
-            flag INTEGER NOT NULL DEFAULT 0
+            flag INTEGER NOT NULL DEFAULT 0,
+            last_action_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS specialists (
@@ -98,7 +100,8 @@ def init_db():
             room_activity REAL DEFAULT 0,
             unlocks REAL DEFAULT 0,
             calls INTEGER DEFAULT 0,
-            sms INTEGER DEFAULT 0
+            sms INTEGER DEFAULT 0,
+            screen_time_minutes REAL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS messages (
@@ -131,13 +134,24 @@ def init_db():
             unlocks_avg REAL,
             calls_avg REAL,
             sms_avg REAL,
+            screen_time_minutes_avg REAL,
             phone_activity_pct REAL,
             app_usage_pct REAL,
             movement_pct REAL,
             room_activity_pct REAL,
             unlocks_pct REAL,
             calls_pct REAL,
-            sms_pct REAL
+            sms_pct REAL,
+            screen_time_minutes_pct REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS patient_circadian_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id TEXT NOT NULL,
+            computed_at TEXT NOT NULL,
+            hourly_profile TEXT NOT NULL,
+            deviation_pct REAL,
+            shifted INTEGER
         );
         """
     )
@@ -146,6 +160,32 @@ def init_db():
         "INSERT OR IGNORE INTO specialists (id, password) VALUES (?, ?)",
         ("spec001", "test1234"),
     )
+    conn.commit()
+    conn.close()
+    _migrate_existing_columns()
+
+
+def _migrate_existing_columns():
+    """CREATE TABLE IF NOT EXISTS nie dodaje nowych kolumn do tabel, które już
+    istnieją (np. baza utworzona przed dodaniem tej funkcji — zwłaszcza na
+    serwerze wdrożonym na trwałym wolumenie, gdzie plik bazy przeżywa redeploy).
+    Dlatego sprawdzamy brakujące kolumny ręcznie i dopisujemy je przez ALTER TABLE,
+    zamiast kasować/odtwarzać tabelę — to jest właśnie ta "architektura append-only":
+    nawet aktualizacja kodu serwera nie rusza już zapisanych danych."""
+    conn = get_db()
+    migrations = {
+        "patients": [("last_action_at", "TEXT")],
+        "behavior_data": [("screen_time_minutes", "REAL DEFAULT 0")],
+        "patient_stats_snapshots": [
+            ("screen_time_minutes_avg", "REAL"),
+            ("screen_time_minutes_pct", "REAL"),
+        ],
+    }
+    for table, columns in migrations.items():
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for col_name, col_type in columns:
+            if col_name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
     conn.commit()
     conn.close()
 
@@ -277,9 +317,17 @@ class BehaviorDataRequest(BaseModel):
     unlocks: float = 0
     calls: int = 0
     sms: int = 0
+    # Realny czas korzystania z telefonu w oknie synchronizacji (minuty), a nie %
+    # jak phone_activity — patrz DataCollector.kt w apce Pacjenta.
+    screen_time_minutes: float = 0
 
 
 class LoginRequest(BaseModel):
+    specialist_id: str
+    password: str
+
+
+class RegisterSpecialistRequest(BaseModel):
     specialist_id: str
     password: str
 
@@ -323,11 +371,12 @@ def send_behavior_data(patient_id: str, data: BehaviorDataRequest):
         raise HTTPException(404, "Nieznany pacjent — najpierw wywołaj /patients/register")
     conn.execute(
         """INSERT INTO behavior_data
-           (patient_id, timestamp, phone_activity, app_usage, movement, room_activity, unlocks, calls, sms)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (patient_id, timestamp, phone_activity, app_usage, movement, room_activity, unlocks, calls, sms, screen_time_minutes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             patient_id, now_iso(), data.phone_activity, data.app_usage,
             data.movement, data.room_activity, data.unlocks, data.calls, data.sms,
+            data.screen_time_minutes,
         ),
     )
     conn.execute("UPDATE patients SET last_sync = ? WHERE id = ?", (now_iso(), patient_id))
@@ -373,7 +422,10 @@ def ack_message(patient_id: str, message_id: int):
 # policzoną średnią — różnica w % to właśnie strzałka "wzrost/spadek" widoczna w panelu
 # specjalisty (dokładnie tak, jak na oryginalnych makietach z prezentacji).
 
-STATS_METRICS = ["phone_activity", "app_usage", "movement", "room_activity", "unlocks", "calls", "sms"]
+STATS_METRICS = [
+    "phone_activity", "app_usage", "movement", "room_activity",
+    "unlocks", "calls", "sms", "screen_time_minutes",
+]
 SNAPSHOT_MAX_AGE = timedelta(hours=1)
 
 
@@ -469,9 +521,121 @@ async def _background_stats_refresher():
             conn.close()
             for pid in patient_ids:
                 ensure_fresh_snapshot(pid)
+                ensure_fresh_circadian(pid)
         except Exception:
             pass
         await asyncio.sleep(BACKGROUND_STATS_INTERVAL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# RYTM DOBOWY — profil aktywności wg godziny doby, przeliczany najwyżej raz na
+# dobę, z 15% tolerancją zmiany między kolejnymi dniami
+# ---------------------------------------------------------------------------
+#
+# Pomysł: liczymy, jak wygląda "typowy dzień" pacjenta — średnią aktywność
+# telefonu osobno dla każdej z 24 godzin doby, na podstawie ostatnich 24h
+# danych (bucketing po godzinie zegarowej, nie po dacie kalendarzowej, więc
+# działa od razu, a nie dopiero od północy). Porównujemy ten świeży profil do
+# poprzedniego (sprzed ~doby) — jeśli uśredniona zmiana między godzinami
+# przekracza 15%, oznaczamy to jako "zmianę rytmu dobowego" (np. przesunięcie
+# pory aktywności, co bywa objawem klinicznie istotnym w monitoringu
+# behawioralnym). 15% to świadomie przyjęty próg tolerancji — dzień w dzień
+# rytm naturalnie trochę "pływa", więc mniejsze wahania nie powinny alarmować.
+
+CIRCADIAN_MAX_AGE = timedelta(hours=24)
+CIRCADIAN_TOLERANCE_PCT = 15.0
+
+
+def compute_circadian_snapshot(patient_id: str) -> Optional[dict]:
+    """Liczy nowy profil aktywności wg godziny doby (24 kubełki) z ostatnich 24h
+    i porównuje go do poprzedniego profilu. Zwraca None, jeśli brak jakichkolwiek
+    danych w tym oknie (nic do policzenia)."""
+    conn = get_db()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds")
+    rows = conn.execute(
+        """SELECT CAST(strftime('%H', timestamp) AS INTEGER) AS hr,
+                  AVG(phone_activity) AS avg_val, COUNT(*) AS n
+           FROM behavior_data WHERE patient_id = ? AND timestamp >= ?
+           GROUP BY hr""",
+        (patient_id, cutoff),
+    ).fetchall()
+
+    if not rows or sum(r["n"] for r in rows) == 0:
+        conn.close()
+        return None
+
+    profile = [None] * 24  # profile[h] = średnia phone_activity dla godziny h (0-23), None = brak danych
+    for r in rows:
+        profile[r["hr"]] = r["avg_val"]
+
+    previous = conn.execute(
+        "SELECT * FROM patient_circadian_snapshots WHERE patient_id = ? ORDER BY id DESC LIMIT 1",
+        (patient_id,),
+    ).fetchone()
+
+    deviation_pct: Optional[float] = None
+    shifted: Optional[bool] = None
+    if previous:
+        try:
+            prev_profile = json.loads(previous["hourly_profile"])
+        except Exception:
+            prev_profile = [None] * 24
+        diffs = []
+        for cur_val, prev_val in zip(profile, prev_profile):
+            if cur_val is None or prev_val is None:
+                continue  # godzina bez danych w jednym z dwóch dni — pomijamy, nie zerujemy
+            if prev_val == 0:
+                diffs.append(0.0 if cur_val == 0 else 100.0)
+            else:
+                diffs.append(abs(cur_val - prev_val) / prev_val * 100.0)
+        if diffs:
+            deviation_pct = round(sum(diffs) / len(diffs), 1)
+            shifted = deviation_pct > CIRCADIAN_TOLERANCE_PCT
+
+    computed_at = now_iso()
+    conn.execute(
+        """INSERT INTO patient_circadian_snapshots
+           (patient_id, computed_at, hourly_profile, deviation_pct, shifted)
+           VALUES (?, ?, ?, ?, ?)""",
+        (patient_id, computed_at, json.dumps(profile), deviation_pct,
+         None if shifted is None else int(shifted)),
+    )
+    conn.commit()
+    conn.close()
+
+    return {"computed_at": computed_at, "deviation_pct": deviation_pct, "shifted": shifted}
+
+
+def ensure_fresh_circadian(patient_id: str) -> Optional[dict]:
+    """Jak ensure_fresh_snapshot, ale próg świeżości to 24h zamiast 1h —
+    rytm dobowy z sensu rzeczy nie ma co przeliczać częściej niż raz na dzień."""
+    conn = get_db()
+    latest = conn.execute(
+        "SELECT * FROM patient_circadian_snapshots WHERE patient_id = ? ORDER BY id DESC LIMIT 1",
+        (patient_id,),
+    ).fetchone()
+    conn.close()
+
+    needs_refresh = True
+    if latest:
+        try:
+            computed_at = datetime.fromisoformat(latest["computed_at"])
+            needs_refresh = (datetime.now(timezone.utc) - computed_at) >= CIRCADIAN_MAX_AGE
+        except Exception:
+            needs_refresh = True
+
+    if needs_refresh:
+        fresh = compute_circadian_snapshot(patient_id)
+        if fresh is not None:
+            return fresh
+        if latest is None:
+            return None
+
+    return {
+        "computed_at": latest["computed_at"],
+        "deviation_pct": latest["deviation_pct"],
+        "shifted": None if latest["shifted"] is None else bool(latest["shifted"]),
+    }
 
 
 def _maybe_open_dashboard_in_browser():
@@ -518,9 +682,15 @@ def get_latest_data(patient_id: str):
     percents = snapshot["percents"] if snapshot else {m: None for m in STATS_METRICS}
     stats_computed_at = snapshot["computed_at"] if snapshot else None
 
+    circadian = ensure_fresh_circadian(patient_id)
+
     base = {
         "patient_id": patient_id, "name": patient["name"], "last_sync": patient["last_sync"],
+        "last_action_at": patient["last_action_at"],
         "stats_computed_at": stats_computed_at,
+        "circadian_computed_at": circadian["computed_at"] if circadian else None,
+        "circadian_deviation_pct": circadian["deviation_pct"] if circadian else None,
+        "circadian_shifted": circadian["shifted"] if circadian else None,
     }
     if not row:
         # brak danych jeszcze przesłanych przez pacjenta — zwracamy zera dla ostatniego odczytu
@@ -550,6 +720,38 @@ def specialist_login(req: LoginRequest):
     if not row:
         raise HTTPException(401, "Błędny login lub hasło")
     return {"status": "ok", "specialist_id": req.specialist_id}
+
+
+@app.post("/specialists/register")
+def register_specialist(req: RegisterSpecialistRequest):
+    """Dodaje nowe konto specjalisty. Używane przez panel na /dashboard (zakładka
+    "Specjaliści") — nie ma tu żadnej autoryzacji admina, bo to prototyp na potrzeby
+    pracy magisterskiej, uruchamiany lokalnie/na własnym Railwayu, a nie publiczny
+    serwis; w realnym wdrożeniu ten endpoint musiałby wymagać osobnego konta admina."""
+    specialist_id = req.specialist_id.strip()
+    if not specialist_id or not req.password:
+        raise HTTPException(400, "ID i hasło nie mogą być puste")
+    conn = get_db()
+    existing = conn.execute("SELECT id FROM specialists WHERE id = ?", (specialist_id,)).fetchone()
+    if existing:
+        conn.close()
+        raise HTTPException(409, "Specjalista z tym ID już istnieje")
+    conn.execute(
+        "INSERT INTO specialists (id, password) VALUES (?, ?)",
+        (specialist_id, req.password),
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "specialist_id": specialist_id}
+
+
+@app.get("/specialists")
+def list_specialists():
+    """Lista kont specjalistów (bez haseł) — do panelu na /dashboard."""
+    conn = get_db()
+    rows = conn.execute("SELECT id FROM specialists ORDER BY id").fetchall()
+    conn.close()
+    return [{"id": r["id"]} for r in rows]
 
 
 @app.get("/specialists/{specialist_id}/patients")
@@ -666,8 +868,14 @@ def caregiver_contact_specialist(patient_id: str):
 
 @app.post("/specialists/{specialist_id}/patients/{patient_id}/clear-flag")
 def clear_flag(specialist_id: str, patient_id: str):
+    """Specjalista klika wykrzyknik przy pacjencie i wybiera 'Podjęto działania' —
+    zdejmujemy flagę ORAZ zapisujemy, kiedy to się stało (last_action_at), żeby
+    można było to pokazać w szczegółach pacjenta."""
     conn = get_db()
-    conn.execute("UPDATE patients SET flag = 0 WHERE id = ?", (patient_id,))
+    conn.execute(
+        "UPDATE patients SET flag = 0, last_action_at = ? WHERE id = ?",
+        (now_iso(), patient_id),
+    )
     conn.commit()
     conn.close()
     return {"status": "ok"}
@@ -769,6 +977,20 @@ def dashboard(request: Request):
   .status-ok {{ color: #2e7d32; font-weight: 600; }}
   .status-err {{ color: #c62828; font-weight: 600; }}
   .logs-table {{ max-height: 420px; overflow-y: auto; display: block; }}
+  .panel {{ background: white; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            padding: 16px 20px; max-width: 420px; }}
+  .panel input {{ display: block; width: 100%; box-sizing: border-box; margin-bottom: 10px;
+                  padding: 8px 10px; font-size: 13px; border: 1px solid #ddd; border-radius: 6px; }}
+  .panel button {{ background: #1a1a2e; color: white; border: none; padding: 8px 16px;
+                    border-radius: 6px; font-size: 13px; cursor: pointer; }}
+  .panel button:hover {{ background: #2a2a4a; }}
+  .form-msg {{ font-size: 12px; margin-top: 8px; min-height: 16px; }}
+  .form-msg.ok {{ color: #2e7d32; }}
+  .form-msg.err {{ color: #c62828; }}
+  .specialists-list {{ margin-top: 16px; }}
+  .chip {{ display: inline-block; background: #f3e5f5; color: #6a1b9a; padding: 3px 10px;
+           border-radius: 10px; font-size: 12px; font-family: ui-monospace, monospace;
+           margin: 0 6px 6px 0; }}
 </style>
 </head>
 <body>
@@ -789,6 +1011,19 @@ def dashboard(request: Request):
     <h2>Podpięte urządzenia</h2>
     <div class="sub">"Online" = kontakt w ciągu ostatnich 60 sekund.</div>
     <div id="devices">Ładowanie...</div>
+  </section>
+
+  <section>
+    <h2>Specjaliści</h2>
+    <div class="sub">Dodaj nowe konto specjalisty (ID + hasło do logowania w apce Specjalisty).
+      Konto domyślne do testów: <span class="mono">spec001</span> / <span class="mono">test1234</span>.</div>
+    <div class="panel">
+      <input id="spec-id" type="text" placeholder="ID specjalisty (np. jkowalski)">
+      <input id="spec-password" type="text" placeholder="Hasło">
+      <button onclick="registerSpecialist()">Dodaj specjalistę</button>
+      <div id="spec-msg" class="form-msg"></div>
+    </div>
+    <div class="specialists-list" id="specialists-list">Ładowanie...</div>
   </section>
 
 <script>
@@ -874,7 +1109,60 @@ async function refreshDevices() {{
   el.innerHTML = html;
 }}
 
-function refreshAll() {{ refreshLogs(); refreshDevices(); }}
+async function refreshSpecialists() {{
+  const el = document.getElementById("specialists-list");
+  let specialists;
+  try {{
+    const resp = await fetch("/specialists");
+    specialists = await resp.json();
+  }} catch (e) {{
+    el.innerHTML = '<div class="empty">Błąd połączenia z serwerem.</div>';
+    return;
+  }}
+  if (specialists.length === 0) {{
+    el.innerHTML = '<div class="empty">Żadnego konta specjalisty.</div>';
+    return;
+  }}
+  el.innerHTML = specialists.map(s => '<span class="chip">' + escapeHtml(s.id) + '</span>').join("");
+}}
+
+async function registerSpecialist() {{
+  const idEl = document.getElementById("spec-id");
+  const pwEl = document.getElementById("spec-password");
+  const msgEl = document.getElementById("spec-msg");
+  const id = idEl.value.trim();
+  const password = pwEl.value;
+  msgEl.textContent = "";
+  msgEl.className = "form-msg";
+  if (!id || !password) {{
+    msgEl.textContent = "Podaj ID i hasło.";
+    msgEl.className = "form-msg err";
+    return;
+  }}
+  try {{
+    const resp = await fetch("/specialists/register", {{
+      method: "POST",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{specialist_id: id, password: password}}),
+    }});
+    if (resp.ok) {{
+      msgEl.textContent = "Dodano konto \\"" + id + "\\".";
+      msgEl.className = "form-msg ok";
+      idEl.value = "";
+      pwEl.value = "";
+      refreshSpecialists();
+    }} else {{
+      const body = await resp.json().catch(() => ({{}}));
+      msgEl.textContent = body.detail || ("Błąd (kod " + resp.status + ").");
+      msgEl.className = "form-msg err";
+    }}
+  }} catch (e) {{
+    msgEl.textContent = "Brak połączenia z serwerem.";
+    msgEl.className = "form-msg err";
+  }}
+}}
+
+function refreshAll() {{ refreshLogs(); refreshDevices(); refreshSpecialists(); }}
 refreshAll();
 setInterval(refreshAll, 2000);
 </script>
