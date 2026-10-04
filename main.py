@@ -711,15 +711,22 @@ def get_latest_data(patient_id: str):
 
 @app.post("/specialists/login")
 def specialist_login(req: LoginRequest):
+    """Porównanie ID jest celowo NIEczułe na wielkość liter (LOWER(id) = LOWER(?)) —
+    np. telefon z klawiaturą, która capitalizuje pierwszą literę, albo ktoś, kto po
+    prostu inaczej zapamiętał wielkość liter w ID, i tak się zaloguje. Hasło zostaje
+    porównywane dokładnie (z wielkością liter) — to jest normalne dla haseł."""
     conn = get_db()
     row = conn.execute(
-        "SELECT id FROM specialists WHERE id = ? AND password = ?",
-        (req.specialist_id, req.password),
+        "SELECT id FROM specialists WHERE LOWER(id) = LOWER(?) AND password = ?",
+        (req.specialist_id.strip(), req.password),
     ).fetchone()
     conn.close()
     if not row:
         raise HTTPException(401, "Błędny login lub hasło")
-    return {"status": "ok", "specialist_id": req.specialist_id}
+    # Zwracamy ID tak, jak jest zapisane w bazie (kanoniczna wielkość liter) — ważne,
+    # bo apka zapamiętuje to ID i używa go dalej (lista pacjentów itd.), więc musi się
+    # zgadzać dokładnie z tym, co ma specialist_id w tabeli patients.
+    return {"status": "ok", "specialist_id": row["id"]}
 
 
 @app.post("/specialists/register")
@@ -732,10 +739,13 @@ def register_specialist(req: RegisterSpecialistRequest):
     if not specialist_id or not req.password:
         raise HTTPException(400, "ID i hasło nie mogą być puste")
     conn = get_db()
-    existing = conn.execute("SELECT id FROM specialists WHERE id = ?", (specialist_id,)).fetchone()
+    # Sprawdzamy duplikat też bez rozróżniania wielkości liter — inaczej dałoby się
+    # przez przypadek stworzyć "spec001" i "Spec001" jako dwa różne konta, co tylko
+    # pogłębiłoby zamieszanie z wielkością liter przy logowaniu.
+    existing = conn.execute("SELECT id FROM specialists WHERE LOWER(id) = LOWER(?)", (specialist_id,)).fetchone()
     if existing:
         conn.close()
-        raise HTTPException(409, "Specjalista z tym ID już istnieje")
+        raise HTTPException(409, f"Specjalista z tym ID już istnieje (jako \"{existing['id']}\")")
     conn.execute(
         "INSERT INTO specialists (id, password) VALUES (?, ?)",
         (specialist_id, req.password),
