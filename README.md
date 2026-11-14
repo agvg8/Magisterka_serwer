@@ -1,4 +1,4 @@
-# ChaD-Sence — serwer lokalny
+# DEPRESS-SENSE — serwer lokalny
 
 Testowy backend (Python + FastAPI + SQLite) dla 3 aplikacji: Pacjent, Specjalista, Opiekun.
 Pełna instrukcja konfiguracji krok po kroku jest w głównym pliku `SETUP.md` w repozytorium —
@@ -27,10 +27,10 @@ odczytywany z faktycznie działającego serwera, więc baner jest poprawny
 niezależnie od tego, jaki `--port` podano przy starcie.
 
 Jeśli nie chcesz, żeby przeglądarka otwierała się sama (np. na serwerze bez
-GUI), ustaw zmienną środowiskową `CHAD_SENCE_NO_BROWSER=1` przed uruchomieniem:
+GUI), ustaw zmienną środowiskową `DEPRESS_SENSE_NO_BROWSER=1` przed uruchomieniem:
 
 ```bash
-CHAD_SENCE_NO_BROWSER=1 uvicorn main:app --host 0.0.0.0 --port 8000
+DEPRESS_SENSE_NO_BROWSER=1 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 Zmienna `PORT` (jeśli ustawiona) jest używana tylko przy budowaniu adresu w
@@ -96,15 +96,105 @@ Wynik w odpowiedzi API: `stats_computed_at` (kiedy policzono) oraz dla każdej m
 `{metryka}_avg` (średnia) i `{metryka}_pct` (procent zmiany; `null`, gdy nie ma jeszcze
 poprzedniej migawki do porównania — np. przy pierwszym pomiarze pacjenta).
 
+## Rytm dobowy: wykrywanie przesunięcia wzorca aktywności (15% tolerancji)
+
+Oprócz statystyk 24h opisanych wyżej, serwer liczy osobno **rytm dobowy** pacjenta —
+czy jego wzorzec aktywności w ciągu doby (o jakich godzinach jest aktywny, a o jakich
+nie) zmienił się od wczoraj. To co innego niż zwykła średnia: dwóch pacjentów może mieć
+identyczną średnią aktywność z całej doby, ale zupełnie inny rozkład w czasie (jeden
+aktywny rano, drugi w nocy) — rytm dobowy wyłapuje właśnie tę zmianę rozkładu.
+
+**Jak to jest liczone:**
+
+1. Z tabeli `behavior_data` z ostatnich 24h budowany jest **profil godzinowy** —
+   24 wartości (jedna na każdą godzinę doby 0–23), każda to średnia `phone_activity`
+   ze wszystkich pakietów, jakie wpadły w tę godzinę (`strftime('%H', timestamp)`).
+2. Ten świeży profil jest porównywany z **poprzednio zapisanym profilem** (migawka
+   sprzed ~doby, tabela `patient_circadian_snapshots`) — liczona jest średnia
+   bezwzględna % różnica, godzina po godzinie, tylko dla godzin, w których obie migawki
+   mają dane.
+3. Jeśli ta średnia różnica przekracza **próg tolerancji 15%**, pacjent jest oznaczany
+   jako `shifted: true` (rytm dobowy się zmienił) — inaczej `shifted: false` (stabilny).
+4. Tak jak przy statystykach 24h, przeliczenie jest **leniwe i ograniczone do raz na
+   dobę na pacjenta**: przy każdym odczycie `GET /patients/{id}/data` serwer sprawdza
+   wiek ostatniej migawki rytmu i liczy nową tylko, jeśli minęło ponad 24h; dodatkowo
+   w tle (ta sama pętla co statystyki 24h) dolicza świeże migawki, nawet gdy nikt nie
+   zagląda na ekran.
+
+Pole `shifted = null` (zamiast `true`/`false`) oznacza, że nie ma jeszcze punktu
+odniesienia (np. pierwsza doba pacjenta w systemie) — wtedy apki pokazują "ustalanie
+wzorca…" zamiast koloru ostrzegawczego.
+
+Wynik w API (`GET /patients/{id}/data`): `circadian_computed_at`, `circadian_deviation_pct`,
+`circadian_shifted`. Historia wszystkich migawek zostaje w bazie (append-only, jak reszta
+danych behawioralnych) — tabela `patient_circadian_snapshots` nigdy nie jest nadpisywana.
+
+Przetestowane: symulacja dwóch dób z profilem przesuniętym o +40% poprawnie daje
+`shifted: true`, a profil przesunięty tylko o +5% (w granicach tolerancji) poprawnie
+daje `shifted: false`; leniwe cachowanie (brak przeliczenia przed upływem 24h) też
+zweryfikowane.
+
+## Czas korzystania z telefonu (screen time)
+
+Nowa metryka obok dotychczasowych: `screen_time_minutes` — realny czas w minutach, przez
+jaki ekran telefonu był interaktywny w oknie danego pakietu (pacjent realnie trzymał/
+patrzył na telefon, nie tylko miał go przy sobie). Liczona z tego samego dziennika
+`UsageEvents`, z którego już liczony był `phone_activity` (tam jako % okna, tu jako
+liczba minut) — więc nie ma dodatkowego zużycia baterii ani nowych uprawnień. W API
+(podobnie jak pozostałe metryki) dochodzi `screen_time_minutes_avg` (średnia z 24h) i
+`screen_time_minutes_pct` (% zmiany względem poprzedniej migawki).
+
+## Ostatnia podjęta akcja specjalisty (`last_action_at`)
+
+Kiedy specjalista kliknie wykrzyknik przy pacjencie na liście i potwierdzi "Podjęto
+działania", serwer zapisuje aktualny czas w polu `patients.last_action_at` (oprócz
+wyzerowania flagi `flag`). To pole **jest aktualizowane w miejscu** (podobnie jak profil
+pacjenta) — celowo, bo interesuje nas tylko *ostatnia* taka akcja, nie cała historia
+kliknięć; jeśli w przyszłości potrzebna byłaby pełna historia działań specjalisty, to
+osobna tabela append-only, analogiczna do `patient_circadian_snapshots`.
+
 ## Domyślne konto specjalisty (do testów)
 
 - ID: `spec001`
 - Hasło: `test1234`
 
+To konto jest zaszyte w kodzie serwera (`init_db()` w `main.py`) i wgrywane do bazy
+samo przy pierwszym starcie (`INSERT OR IGNORE`, więc kolejne restarty nic nie zmieniają).
+
+## Logowanie specjalisty: ID jest NIEczułe na wielkość liter
+
+Żeby uniknąć klasycznej pułapki "wpisałem ID z telefonu i serwer mówi, że hasło jest
+złe, bo klawiatura capitalizuje pierwszą literę" — logowanie (`POST /specialists/login`)
+porównuje ID **bez rozróżniania wielkości liter** (`LOWER(id) = LOWER(?)`). Hasło wciąż
+jest porównywane dokładnie. Rejestracja (`POST /specialists/register`) też sprawdza
+duplikaty bez rozróżniania wielkości liter, więc nie da się przez przypadek stworzyć
+`spec001` i `Spec001` jako dwóch różnych kont. Serwer zawsze odsyła ID w takiej
+wielkości liter, w jakiej jest zapisane w bazie (nie w takiej, jaką wpisano przy
+logowaniu) — apka Specjalisty używa tego zwróconego ID do dalszych zapytań (lista
+pacjentów itd.), więc to musi się zgadzać z kolumną `specialist_id` w tabeli `patients`.
+
+## Panel dodawania specjalistów
+
+Na `/dashboard` jest teraz sekcja "Specjaliści" — prosty formularz (ID + hasło), który
+dodaje nowe konto specjalisty bez grzebania w bazie ręcznie, plus lista istniejących kont
+(tylko ID, hasła nigdy nie są pokazywane). Pod spodem wywołuje:
+
+- `POST /specialists/register` — body `{"specialist_id": "...", "password": "..."}`.
+  `409`, jeśli takie ID już istnieje; `400`, jeśli ID lub hasło jest puste.
+- `GET /specialists` — lista `[{"id": "..."}, ...]`, bez haseł.
+
+**Uwaga bezpieczeństwa (ważne, żeby wspomnieć na obronie):** ten endpoint nie wymaga
+żadnej autoryzacji admina — każdy, kto ma dostęp do `/dashboard`, może dodać konto
+specjalisty. To świadome uproszczenie prototypu testowego uruchamianego lokalnie albo na
+własnym Railwayu (nie publicznego serwisu) — w realnym wdrożeniu rejestracja nowych
+specjalistów powinna wymagać zalogowania jako administrator. Hasła są też przechowywane
+w bazie jako zwykły tekst (bez haszowania) — tak samo jak konto domyślne `spec001` — co
+jest kolejnym, celowym uproszczeniem tego prototypu, a nie wzorcem do pracy magisterskiej.
+
 ## Baza danych
 
-Plik `chad_sence.db` (SQLite) tworzy się automatycznie przy pierwszym uruchomieniu w tym
-samym katalogu (albo pod ścieżką ze zmiennej `CHAD_SENCE_DB_PATH` — patrz niżej). Żeby
+Plik `depress_sense.db` (SQLite) tworzy się automatycznie przy pierwszym uruchomieniu w tym
+samym katalogu (albo pod ścieżką ze zmiennej `DEPRESS_SENSE_DB_PATH` — patrz niżej). Żeby
 zresetować wszystkie dane — po prostu go usuń i uruchom serwer ponownie.
 
 **Dane behawioralne (`behavior_data`) i migawki statystyk (`patient_stats_snapshots`)
@@ -124,7 +214,7 @@ w nieskończoność bez żadnej wartości analitycznej.
 Domyślnie serwer zakłada, że telefon i komputer są w tej samej sieci WiFi (`SETUP.md`).
 Żeby zamiast tego mieć serwer dostępny z internetu (np. do pokazania promotorowi bez
 kombinowania z siecią), trzeba hosta z **trwałym dyskiem** — zwykły darmowy hosting bez
-tej opcji kasuje plik `chad_sence.db` przy każdym restarcie/redeployu kontenera, bo jego
+tej opcji kasuje plik `depress_sense.db` przy każdym restarcie/redeployu kontenera, bo jego
 system plików jest tymczasowy.
 
 Najprościej: **[Railway](https://railway.com)** ma gotowy szablon `FastAPI + SQLite`
@@ -144,27 +234,27 @@ i CLI zamiast panelu webowego.
 3. Dodaj **Volume** (zakładka "Volumes" w serwisie) — punkt montowania np. `/data`.
 4. Ustaw zmienne środowiskowe serwisu:
    ```
-   CHAD_SENCE_DB_PATH=/data/chad_sence.db
-   CHAD_SENCE_PUBLIC_URL=https://<twoja-domena>.up.railway.app
+   DEPRESS_SENSE_DB_PATH=/data/depress_sense.db
+   DEPRESS_SENSE_PUBLIC_URL=https://<twoja-domena>.up.railway.app
    ```
    (dokładną domenę Railway pokaże po pierwszym deployu, w zakładce "Settings → Networking
-   → Generate Domain" — wtedy wróć i dopisz ją jako `CHAD_SENCE_PUBLIC_URL`, potem redeploy).
+   → Generate Domain" — wtedy wróć i dopisz ją jako `DEPRESS_SENSE_PUBLIC_URL`, potem redeploy).
 5. Ustaw komendę startową (Settings → Deploy → Start Command):
    ```
    uvicorn main:app --host 0.0.0.0 --port $PORT
    ```
 6. Po wdrożeniu wejdź na `https://<twoja-domena>.up.railway.app/dashboard` — baner na
-   górze pokaże teraz Twój publiczny adres (dzięki `CHAD_SENCE_PUBLIC_URL`) zamiast
+   górze pokaże teraz Twój publiczny adres (dzięki `DEPRESS_SENSE_PUBLIC_URL`) zamiast
    lokalnego IP, bo automatyczne wykrywanie IP nie ma sensu na hostingu w chmurze.
-7. W każdej z 3 aplikacji na telefonie w polu adresu serwera wpisz **pełny adres z
-   `https://`**, np. `https://chadsence-production.up.railway.app` — apki już to
-   obsługują (jeśli podasz adres bez `http://`/`https://`, sama dokleja `http://`, więc
-   dla wersji w chmurze zawsze podawaj pełny adres z `https://`). Telefon i serwer nie
-   muszą już być w tej samej sieci WiFi — apka zadziała z dowolnego miejsca z internetem.
+7. Adres serwera jest teraz zaszyty na stałe w kodzie aplikacji (stała
+   `NetworkModule.DEFAULT_SERVER_URL` w każdej z 3 apek) — nie ma już ekranu, w którym
+   użytkownik wpisuje go ręcznie. Jeśli zmienia się publiczny adres wdrożenia, trzeba
+   zaktualizować tę stałą w kodzie wszystkich 3 apek i zbudować apki na nowo. Telefon i
+   serwer nie muszą być w tej samej sieci WiFi — apka zadziała z dowolnego miejsca z internetem.
 
-**Uwaga o `CHAD_SENCE_NO_BROWSER`:** na serwerze w chmurze automatyczne otwieranie
-przeglądarki i tak się nie uda (brak GUI) — ustawienie `CHAD_SENCE_PUBLIC_URL` wyłącza tę
-próbę automatycznie, więc nie trzeba dodatkowo ustawiać `CHAD_SENCE_NO_BROWSER`.
+**Uwaga o `DEPRESS_SENSE_NO_BROWSER`:** na serwerze w chmurze automatyczne otwieranie
+przeglądarki i tak się nie uda (brak GUI) — ustawienie `DEPRESS_SENSE_PUBLIC_URL` wyłącza tę
+próbę automatycznie, więc nie trzeba dodatkowo ustawiać `DEPRESS_SENSE_NO_BROWSER`.
 
 Sources:
 - [Deploy & Host official-fastapi-backend-sqlite | Railway](https://railway.com/deploy/official-fastapi-backend-sqlite)
