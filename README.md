@@ -260,3 +260,29 @@ Sources:
 - [Deploy & Host official-fastapi-backend-sqlite | Railway](https://railway.com/deploy/official-fastapi-backend-sqlite)
 - [Railway Pricing](https://railway.com/pricing)
 - [Best Python Hosting Providers in 2026 (Compared) — Fly.io](https://fly.io/learn/python-hosting/)
+
+
+## Panele WWW i logowanie administratora (aktualizacja 2026-11-15)
+
+Dwie osobne strony, obie za logowaniem administratora (HTTP Basic — przeglądarka sama
+zapyta o login i hasło):
+
+- `/dashboard` — **monitoring serwera**: adres, logi żądań na żywo, podpięte urządzenia.
+- `/admin` — **użytkownicy**: dodawanie specjalistów (z generatorem hasła), reset/wymuszenie
+  zmiany hasła, usuwanie kont; pacjenci (wyszukiwarka, filtr, przypisanie/odpięcie od
+  specjalisty z listy, usuwanie wraz ze WSZYSTKIMI danymi) i opiekunowie (odłączanie).
+
+Zmienne środowiskowe:
+
+| Zmienna | Znaczenie |
+|---|---|
+| `DEPRESS_SENSE_ADMIN_PASSWORD` | hasło administratora. **Na Railway obowiązkowe** — bez niego (przy ustawionym `DEPRESS_SENSE_PUBLIC_URL`) panele i endpointy administracyjne zwracają 503. Lokalnie, bez tej zmiennej, panel działa otwarcie jak dotąd. |
+| `DEPRESS_SENSE_ADMIN_USER` | login administratora (domyślnie `admin`) |
+| `DEPRESS_SENSE_SEED_TEST_ACCOUNT=1` | tworzy konto testowe `spec001`/`test1234` także na serwerze zewnętrznym (domyślnie tam NIE jest tworzone) |
+
+Hasła specjalistów są zapisywane jako hash PBKDF2-SHA256 z solą; konta sprzed tej zmiany
+(hasło jawnym tekstem) są automatycznie przepisywane na hash przy pierwszym udanym
+logowaniu. Minimalna długość hasła: 8 znaków. Po 5 nieudanych próbach logowania w 5 minut
+dane konto jest blokowane na resztę okna (429).
+
+`python main.py` (np. przycisk Run w IDE) uruchamia serwer tak samo jak komenda `uvicorn`.

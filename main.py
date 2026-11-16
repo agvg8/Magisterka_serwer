@@ -12,8 +12,11 @@ Uruchomienie (patrz README.md):
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import socket
 import sqlite3
 import time
@@ -23,8 +26,9 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 
 # Ścieżkę do pliku bazy można nadpisać zmienną środowiskową DEPRESS_SENSE_DB_PATH —
@@ -70,6 +74,98 @@ def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+# ---------------------------------------------------------------------------
+# Bezpieczeństwo: hasła, logowanie administratora, ograniczenie prób logowania
+# ---------------------------------------------------------------------------
+
+_PBKDF2_ITERATIONS = 200_000
+_PASSWORD_PREFIX = "pbkdf2_sha256$"
+MIN_PASSWORD_LENGTH = 8
+
+
+def hash_password(password: str) -> str:
+    """PBKDF2-HMAC-SHA256 z losową solą (sama biblioteka standardowa — bez nowej
+    zależności w requirements.txt). Format: pbkdf2_sha256$iteracje$sól$hash."""
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, _PBKDF2_ITERATIONS)
+    return f"{_PASSWORD_PREFIX}{_PBKDF2_ITERATIONS}${salt.hex()}${dk.hex()}"
+
+
+def verify_password(stored: str, password: str) -> bool:
+    """Porównuje hasło z zapisanym hashem. Wiersze sprzed wprowadzenia hashowania
+    (hasło jawnym tekstem, bez prefiksu) też są akceptowane — i przy pierwszym
+    udanym logowaniu zostają automatycznie przepisane na hash (patrz specialist_login),
+    więc istniejące konta na Railway nie przestają działać po aktualizacji."""
+    if stored.startswith(_PASSWORD_PREFIX):
+        try:
+            _, iters, salt_hex, hash_hex = stored.split("$")
+            dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iters))
+        except Exception:
+            return False
+        return hmac.compare_digest(dk.hex(), hash_hex)
+    return hmac.compare_digest(stored.encode("utf-8"), password.encode("utf-8"))
+
+
+def is_hashed(stored: str) -> bool:
+    return stored.startswith(_PASSWORD_PREFIX)
+
+
+# Logowanie administratora (panel /admin, /dashboard i endpointy administracyjne):
+# HTTP Basic, login z DEPRESS_SENSE_ADMIN_USER (domyślnie "admin"), hasło z
+# DEPRESS_SENSE_ADMIN_PASSWORD. Bez tej zmiennej: lokalnie (brak PUBLIC_URL) panel
+# działa otwarcie jak dotąd; na serwerze zewnętrznym jest ZABLOKOWANY, dopóki
+# hasło nie zostanie ustawione — lepiej zablokować panel niż zostawić go otwartego
+# dla każdego, kto zna adres serwera.
+ADMIN_USER = os.environ.get("DEPRESS_SENSE_ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.environ.get("DEPRESS_SENSE_ADMIN_PASSWORD")
+_admin_basic = HTTPBasic(auto_error=False)
+
+
+def require_admin(credentials: Optional[HTTPBasicCredentials] = Depends(_admin_basic)):
+    if not ADMIN_PASSWORD:
+        if PUBLIC_URL:
+            raise HTTPException(
+                503,
+                "Panel administratora jest wyłączony: ustaw zmienną środowiskową "
+                "DEPRESS_SENSE_ADMIN_PASSWORD na serwerze (Railway → Variables) i zrestartuj usługę.",
+            )
+        return
+    ok = (
+        credentials is not None
+        and secrets.compare_digest(credentials.username.encode("utf-8"), ADMIN_USER.encode("utf-8"))
+        and secrets.compare_digest(credentials.password.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8"))
+    )
+    if not ok:
+        raise HTTPException(
+            401, "Wymagane logowanie administratora",
+            headers={"WWW-Authenticate": 'Basic realm="DEPRESS-SENSE admin", charset="UTF-8"'},
+        )
+
+
+# Ograniczenie prób zgadywania hasła specjalisty: po 5 nieudanych próbach w ciągu
+# 5 minut dla danego loginu kolejne są odrzucane (429). Licznik w pamięci procesu —
+# wystarcza na prototyp z jedną instancją serwera.
+_LOGIN_FAILS: dict = {}
+LOGIN_MAX_FAILS = 5
+LOGIN_WINDOW_SECONDS = 300
+
+
+def _login_key(specialist_id: str) -> str:
+    return specialist_id.strip().lower()
+
+
+def _check_login_throttle(key: str):
+    now = time.time()
+    fails = [t for t in _LOGIN_FAILS.get(key, []) if now - t < LOGIN_WINDOW_SECONDS]
+    _LOGIN_FAILS[key] = fails
+    if len(fails) >= LOGIN_MAX_FAILS:
+        raise HTTPException(429, "Zbyt wiele nieudanych prób logowania. Spróbuj ponownie za kilka minut.")
+
+
+def _register_login_failure(key: str):
+    _LOGIN_FAILS.setdefault(key, []).append(time.time())
 
 
 def init_db():
@@ -277,10 +373,13 @@ def init_db():
     )
     # Domyślne konto specjalisty do testów, żeby nie trzeba było nic rejestrować ręcznie —
     # must_change_password=0, bo to konto deweloperskie, a nie realne konto badacza.
-    cur.execute(
-        "INSERT OR IGNORE INTO specialists (id, password, must_change_password) VALUES (?, ?, 0)",
-        ("spec001", "test1234"),
-    )
+    # Na serwerze zewnętrznym (PUBLIC_URL) konto z publicznie znanym hasłem NIE jest już
+    # tworzone domyślnie — chyba że jawnie ustawiono DEPRESS_SENSE_SEED_TEST_ACCOUNT=1.
+    if not PUBLIC_URL or os.environ.get("DEPRESS_SENSE_SEED_TEST_ACCOUNT") == "1":
+        cur.execute(
+            "INSERT OR IGNORE INTO specialists (id, password, must_change_password) VALUES (?, ?, 0)",
+            ("spec001", hash_password("test1234")),
+        )
     conn.commit()
     conn.close()
     _migrate_existing_columns()
@@ -1640,14 +1739,23 @@ def specialist_login(req: LoginRequest):
     np. telefon z klawiaturą, która capitalizuje pierwszą literę, albo ktoś, kto po
     prostu inaczej zapamiętał wielkość liter w ID, i tak się zaloguje. Hasło zostaje
     porównywane dokładnie (z wielkością liter) — to jest normalne dla haseł."""
+    key = _login_key(req.specialist_id)
+    _check_login_throttle(key)
     conn = get_db()
     row = conn.execute(
-        "SELECT id, must_change_password FROM specialists WHERE LOWER(id) = LOWER(?) AND password = ?",
-        (req.specialist_id.strip(), req.password),
+        "SELECT id, password, must_change_password FROM specialists WHERE LOWER(id) = LOWER(?)",
+        (req.specialist_id.strip(),),
     ).fetchone()
-    conn.close()
-    if not row:
+    if not row or not verify_password(row["password"], req.password):
+        conn.close()
+        _register_login_failure(key)
         raise HTTPException(401, "Błędny login lub hasło")
+    _LOGIN_FAILS.pop(key, None)
+    if not is_hashed(row["password"]):
+        # Konto sprzed wprowadzenia hashowania — przepisujemy hasło na hash.
+        conn.execute("UPDATE specialists SET password = ? WHERE id = ?", (hash_password(req.password), row["id"]))
+        conn.commit()
+    conn.close()
     # Zwracamy ID tak, jak jest zapisane w bazie (kanoniczna wielkość liter) — ważne,
     # bo apka zapamiętuje to ID i używa go dalej (lista pacjentów itd.), więc musi się
     # zgadzać dokładnie z tym, co ma specialist_id w tabeli patients.
@@ -1663,35 +1771,38 @@ def change_password(req: ChangePasswordRequest):
     """Wymuszona zmiana hasła przy pierwszym logowaniu (i dostępna też później).
     Wymaga podania starego hasła — to nie jest reset, tylko zwykła zmiana przez
     zalogowanego już (must_change_password=1) użytkownika."""
+    key = _login_key(req.specialist_id)
+    _check_login_throttle(key)
     conn = get_db()
     row = conn.execute(
-        "SELECT id FROM specialists WHERE LOWER(id) = LOWER(?) AND password = ?",
-        (req.specialist_id.strip(), req.old_password),
+        "SELECT id, password FROM specialists WHERE LOWER(id) = LOWER(?)",
+        (req.specialist_id.strip(),),
     ).fetchone()
-    if not row:
+    if not row or not verify_password(row["password"], req.old_password):
         conn.close()
+        _register_login_failure(key)
         raise HTTPException(401, "Błędne obecne hasło")
-    if not req.new_password or len(req.new_password) < 4:
+    if not req.new_password or len(req.new_password) < MIN_PASSWORD_LENGTH:
         conn.close()
-        raise HTTPException(400, "Nowe hasło jest za krótkie")
+        raise HTTPException(400, f"Nowe hasło jest za krótkie (minimum {MIN_PASSWORD_LENGTH} znaków)")
     conn.execute(
         "UPDATE specialists SET password = ?, must_change_password = 0 WHERE id = ?",
-        (req.new_password, row["id"]),
+        (hash_password(req.new_password), row["id"]),
     )
     conn.commit()
     conn.close()
     return {"status": "ok", "specialist_id": row["id"]}
 
 
-@app.post("/specialists/register")
+@app.post("/specialists/register", dependencies=[Depends(require_admin)])
 def register_specialist(req: RegisterSpecialistRequest):
-    """Dodaje nowe konto specjalisty. Używane przez panel na /dashboard (zakładka
-    "Specjaliści") — nie ma tu żadnej autoryzacji admina, bo to prototyp na potrzeby
-    pracy magisterskiej, uruchamiany lokalnie/na własnym Railwayu, a nie publiczny
-    serwis; w realnym wdrożeniu ten endpoint musiałby wymagać osobnego konta admina."""
+    """Dodaje nowe konto specjalisty. Używane przez panel użytkowników /admin;
+    wymaga zalogowania administratora (patrz require_admin)."""
     specialist_id = req.specialist_id.strip()
     if not specialist_id or not req.password:
         raise HTTPException(400, "ID i hasło nie mogą być puste")
+    if len(req.password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(400, f"Hasło jest za krótkie (minimum {MIN_PASSWORD_LENGTH} znaków)")
     conn = get_db()
     # Sprawdzamy duplikat też bez rozróżniania wielkości liter — inaczej dałoby się
     # przez przypadek stworzyć "spec001" i "Spec001" jako dwa różne konta, co tylko
@@ -1702,23 +1813,36 @@ def register_specialist(req: RegisterSpecialistRequest):
         raise HTTPException(409, f"Specjalista z tym ID już istnieje (jako \"{existing['id']}\")")
     conn.execute(
         "INSERT INTO specialists (id, password) VALUES (?, ?)",
-        (specialist_id, req.password),
+        (specialist_id, hash_password(req.password)),
     )
     conn.commit()
     conn.close()
     return {"status": "ok", "specialist_id": specialist_id}
 
 
-@app.get("/specialists")
+@app.get("/specialists", dependencies=[Depends(require_admin)])
 def list_specialists():
-    """Lista kont specjalistów (bez haseł) — do panelu na /dashboard."""
+    """Lista kont specjalistów (bez haseł) — do panelu użytkowników /admin."""
     conn = get_db()
-    rows = conn.execute("SELECT id, must_change_password FROM specialists ORDER BY id").fetchall()
+    rows = conn.execute(
+        """SELECT s.id, s.password, s.must_change_password,
+                  (SELECT COUNT(*) FROM patients p WHERE p.specialist_id = s.id) AS patient_count
+           FROM specialists s ORDER BY s.id"""
+    ).fetchall()
     conn.close()
-    return [{"id": r["id"], "must_change_password": bool(r["must_change_password"])} for r in rows]
+    return [
+        {
+            "id": r["id"],
+            "must_change_password": bool(r["must_change_password"]),
+            "patient_count": r["patient_count"],
+            # Ostrzeżenie w panelu: konto testowe z domyślnym, publicznie znanym hasłem.
+            "default_credentials": r["id"] == "spec001" and verify_password(r["password"], "test1234"),
+        }
+        for r in rows
+    ]
 
 
-@app.delete("/specialists/{specialist_id}")
+@app.delete("/specialists/{specialist_id}", dependencies=[Depends(require_admin)])
 def delete_specialist(specialist_id: str):
     """Usuwa konto specjalisty (panel admina na /dashboard). Pacjentów, którzy byli
     do niego przypisani, cofamy do stanu 'pending' (specialist_id = NULL) zamiast
@@ -1739,7 +1863,7 @@ def delete_specialist(specialist_id: str):
     return {"status": "ok"}
 
 
-@app.post("/specialists/{specialist_id}/force-password-change")
+@app.post("/specialists/{specialist_id}/force-password-change", dependencies=[Depends(require_admin)])
 def force_password_change(specialist_id: str):
     """Admin wymusza zmianę hasła przy NASTĘPNYM logowaniu tego specjalisty
     (np. podejrzenie przejęcia konta, odejście osoby z zespołu itp.) — niezależnie
@@ -1755,7 +1879,7 @@ def force_password_change(specialist_id: str):
     return {"status": "ok"}
 
 
-@app.get("/admin/patients")
+@app.get("/admin/patients", dependencies=[Depends(require_admin)])
 def admin_list_patients():
     """Pełny przegląd pacjentów do panelu admina na /dashboard — w odróżnieniu od
     /specialists/{id}/patients (które widzi tylko SWOICH pacjentów), to widzi
@@ -1778,7 +1902,7 @@ def admin_list_patients():
     ]
 
 
-@app.delete("/admin/patients/{patient_id}")
+@app.delete("/admin/patients/{patient_id}", dependencies=[Depends(require_admin)])
 def admin_delete_patient(patient_id: str):
     """Kasuje pacjenta ORAZ wszystkie powiązane dane (opiekunowie, wiadomości, dane
     behawioralne, migawki statystyk/rytmu dobowego) — celowe odstępstwo od zasady
@@ -1793,6 +1917,9 @@ def admin_delete_patient(patient_id: str):
     for table in (
         "caregivers", "messages", "behavior_data",
         "patient_stats_snapshots", "patient_circadian_snapshots",
+        # Dane kliniczne — wcześniej pomijane, więc "usunięcie pacjenta" zostawiało
+        # w bazie jego samooceny, PHQ-9 i oceny MADRS (osierocone rekordy).
+        "self_assessments", "phq9_responses", "madrs_assessments",
     ):
         conn.execute(f"DELETE FROM {table} WHERE patient_id = ?", (patient_id,))
     conn.execute("DELETE FROM patients WHERE id = ?", (patient_id,))
@@ -1801,7 +1928,7 @@ def admin_delete_patient(patient_id: str):
     return {"status": "ok"}
 
 
-@app.delete("/admin/patients/{patient_id}/caregivers/{caregiver_device_id}")
+@app.delete("/admin/patients/{patient_id}/caregivers/{caregiver_device_id}", dependencies=[Depends(require_admin)])
 def admin_remove_caregiver(patient_id: str, caregiver_device_id: str):
     """Usuwa jedno powiązanie opiekun-pacjent (np. opiekun zgubił telefon, zmiana
     osoby sprawującej opiekę itp.) — zwalnia jedno miejsce z puli caregiver_slots."""
@@ -1815,7 +1942,7 @@ def admin_remove_caregiver(patient_id: str, caregiver_device_id: str):
     return {"status": "ok"}
 
 
-@app.get("/admin/patients/{patient_id}/caregivers")
+@app.get("/admin/patients/{patient_id}/caregivers", dependencies=[Depends(require_admin)])
 def admin_list_caregivers(patient_id: str):
     """Lista device_id opiekunów podpiętych pod danego pacjenta — do rozwijanego
     widoku w panelu admina (przycisk 'usuń' przy każdym)."""
@@ -1967,7 +2094,7 @@ def health():
 # DASHBOARD — podgląd podpiętych urządzeń w czasie rzeczywistym
 # ---------------------------------------------------------------------------
 
-@app.get("/api/devices")
+@app.get("/api/devices", dependencies=[Depends(require_admin)])
 def api_devices():
     """Lista wszystkich urządzeń, które kiedykolwiek odezwały się do serwera,
     posortowana od najświeżej aktywności. Używane przez /dashboard (polling co 2s)."""
@@ -1998,361 +2125,530 @@ def api_devices():
     return result
 
 
-@app.get("/api/logs")
+@app.get("/api/logs", dependencies=[Depends(require_admin)])
 def api_logs():
     """Ostatnie 300 zapytań do serwera, najnowsze pierwsze. Używane przez /dashboard."""
     return list(LOG_BUFFER)
 
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(request: Request):
-    if PUBLIC_URL:
-        # Serwer zewnętrzny — pokazujemy prawdziwy publiczny adres, a nie lokalny IP
-        # kontenera (który i tak byłby bezużyteczny dla kogokolwiek spoza hosta).
-        server_url = PUBLIC_URL.rstrip("/")
-    else:
-        ip = get_local_ip()
-        server_info = request.scope.get("server")
-        port = server_info[1] if server_info and server_info[1] else os.environ.get("PORT", "8000")
-        server_url = f"http://{ip}:{port}"
+# ---------------------------------------------------------------------------
+# PANELE WWW — dwie osobne strony (obie za logowaniem administratora):
+#   /dashboard — monitoring serwera: adres, logi żądań na żywo, podpięte urządzenia
+#   /admin     — zarządzanie użytkownikami: dodawanie i operacje na specjalistach,
+#                pacjentach (przypisanie/odpięcie/usunięcie) i ich opiekunach
+# ---------------------------------------------------------------------------
 
-    return f"""
-<!DOCTYPE html>
-<html lang="pl">
-<head>
-<meta charset="utf-8">
-<title>DEPRESS-SENSE — serwer</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-  :root {{ color-scheme: light dark; }}
-  body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 24px;
-         background: #f4f5f7; color: #1a1a1a; }}
-  h1 {{ font-size: 18px; margin: 0 0 4px; }}
-  h2 {{ font-size: 15px; margin: 0 0 4px; }}
-  .banner {{ background: #1a1a2e; color: white; padding: 16px 20px; border-radius: 10px;
-             margin-bottom: 24px; }}
-  .banner .ip {{ font-family: ui-monospace, monospace; font-size: 22px; font-weight: 700;
-                 color: #7dd3fc; letter-spacing: 0.5px; }}
-  .banner .label {{ font-size: 12px; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; }}
-  section {{ margin-bottom: 28px; }}
-  .sub {{ color: #666; font-size: 13px; margin-bottom: 12px; }}
-  table {{ width: 100%; border-collapse: collapse; background: white; border-radius: 8px;
-          overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-  th, td {{ text-align: left; padding: 8px 14px; font-size: 13px; border-bottom: 1px solid #eee; }}
-  th {{ background: #fafafa; color: #555; font-weight: 600; text-transform: uppercase; font-size: 11px; }}
-  tr:last-child td {{ border-bottom: none; }}
-  .role {{ display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }}
-  .role-pacjent {{ background: #e3f2fd; color: #1565c0; }}
-  .role-specjalista {{ background: #f3e5f5; color: #6a1b9a; }}
-  .role-opiekun {{ background: #e8f5e9; color: #2e7d32; }}
-  .dot {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }}
-  .dot-online {{ background: #2e7d32; }}
-  .dot-offline {{ background: #bbb; }}
-  .mono {{ font-family: ui-monospace, monospace; font-size: 12px; color: #444; }}
-  .empty {{ padding: 40px; text-align: center; color: #888; background: white; border-radius: 8px; }}
-  .muted {{ color: #999; }}
-  .status-ok {{ color: #2e7d32; font-weight: 600; }}
-  .status-err {{ color: #c62828; font-weight: 600; }}
-  .logs-table {{ max-height: 420px; overflow-y: auto; display: block; }}
-  .panel {{ background: white; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-            padding: 16px 20px; max-width: 420px; }}
-  .panel input {{ display: block; width: 100%; box-sizing: border-box; margin-bottom: 10px;
-                  padding: 8px 10px; font-size: 13px; border: 1px solid #ddd; border-radius: 6px; }}
-  .panel button {{ background: #1a1a2e; color: white; border: none; padding: 8px 16px;
-                    border-radius: 6px; font-size: 13px; cursor: pointer; }}
-  .panel button:hover {{ background: #2a2a4a; }}
-  .form-msg {{ font-size: 12px; margin-top: 8px; min-height: 16px; }}
-  .form-msg.ok {{ color: #2e7d32; }}
-  .form-msg.err {{ color: #c62828; }}
-  .specialists-list {{ margin-top: 16px; }}
-  .chip {{ display: inline-block; background: #f3e5f5; color: #6a1b9a; padding: 3px 10px;
-           border-radius: 10px; font-size: 12px; font-family: ui-monospace, monospace;
-           margin: 0 6px 6px 0; }}
-  .status-chip {{ display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }}
-  .status-pending {{ background: #fff3e0; color: #e65100; }}
-  .status-active {{ background: #e8f5e9; color: #2e7d32; }}
-  .btn-sm {{ background: #eee; color: #333; border: none; padding: 4px 10px; border-radius: 6px;
-             font-size: 11px; cursor: pointer; margin-right: 4px; }}
-  .btn-sm:hover {{ background: #ddd; }}
-  .btn-danger {{ background: #ffebee; color: #c62828; }}
-  .btn-danger:hover {{ background: #ffcdd2; }}
-  .btn-warn {{ background: #fff3e0; color: #e65100; }}
-  .btn-warn:hover {{ background: #ffe0b2; }}
-</style>
-</head>
-<body>
+class ResetPasswordRequest(BaseModel):
+    new_password: str
 
-  <div class="banner">
-    <div class="label">Serwer DEPRESS-SENSE działa pod adresem</div>
-    <div class="ip">{server_url}</div>
-    <div class="label" style="margin-top: 6px;">Adres jest zaszyty na stałe w kodzie wszystkich 3 apek — nie trzeba go nigdzie wpisywać.</div>
-  </div>
 
-  <section>
-    <h2>Logi żądań (na żywo)</h2>
-    <div class="sub">Każde zapytanie trafiające do serwera. Odświeża się co 2 sekundy.</div>
-    <div id="logs">Ładowanie...</div>
-  </section>
+class AssignPatientRequest(BaseModel):
+    specialist_id: str
 
-  <section>
-    <h2>Podpięte urządzenia</h2>
-    <div class="sub">"Online" = kontakt w ciągu ostatnich 60 sekund.</div>
-    <div id="devices">Ładowanie...</div>
-  </section>
 
-  <section>
-    <h2>Specjaliści</h2>
-    <div class="sub">Dodaj nowe konto specjalisty (ID + hasło do logowania w apce Specjalisty).
-      Nowe konto wymusza zmianę hasła przy pierwszym logowaniu.
-      Konto domyślne do testów (bez wymuszonej zmiany hasła): <span class="mono">spec001</span> / <span class="mono">test1234</span>.</div>
-    <div class="panel">
-      <input id="spec-id" type="text" placeholder="ID specjalisty (np. jkowalski)">
-      <input id="spec-password" type="text" placeholder="Hasło">
-      <button onclick="registerSpecialist()">Dodaj specjalistę</button>
-      <div id="spec-msg" class="form-msg"></div>
-    </div>
-    <div class="specialists-list" id="specialists-list">Ładowanie...</div>
-  </section>
+@app.post("/admin/specialists/{specialist_id}/reset-password", dependencies=[Depends(require_admin)])
+def admin_reset_specialist_password(specialist_id: str, req: ResetPasswordRequest):
+    """Administrator ustawia nowe hasło specjaliście (np. zapomniał hasła) — z
+    wymuszeniem zmiany przy najbliższym logowaniu, więc admin nie zna hasła na stałe."""
+    if len(req.new_password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(400, f"Hasło jest za krótkie (minimum {MIN_PASSWORD_LENGTH} znaków)")
+    conn = get_db()
+    row = conn.execute("SELECT id FROM specialists WHERE LOWER(id) = LOWER(?)", (specialist_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(404, "Nie znaleziono specjalisty o takim ID")
+    conn.execute(
+        "UPDATE specialists SET password = ?, must_change_password = 1 WHERE id = ?",
+        (hash_password(req.new_password), row["id"]),
+    )
+    conn.commit()
+    conn.close()
+    _LOGIN_FAILS.pop(_login_key(row["id"]), None)
+    return {"status": "ok"}
 
-  <section>
-    <h2>Pacjenci</h2>
-    <div class="sub">Wszyscy zarejestrowani uczestnicy. "Status: oczekuje" = jeszcze nieprzypisany
-      do żadnego specjalisty — apka pacjenta nie wysyła jeszcze danych.</div>
-    <div id="admin-patients">Ładowanie...</div>
-  </section>
 
-<script>
-function escapeHtml(s) {{
-  return (s === null || s === undefined ? "" : String(s)).replace(/[&<>"']/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}}[c]));
-}}
-function fmtAgo(sec) {{
+@app.post("/admin/patients/{patient_id}/assign", dependencies=[Depends(require_admin)])
+def admin_assign_patient(patient_id: str, req: AssignPatientRequest):
+    """Przypisuje pacjenta do wskazanego specjalisty (albo zmienia przypisanie) i
+    aktywuje jego konto — to samo, co robi specjalista w apce, tylko z panelu."""
+    conn = get_db()
+    patient = conn.execute("SELECT id FROM patients WHERE id = ?", (patient_id,)).fetchone()
+    if not patient:
+        conn.close()
+        raise HTTPException(404, "Nie znaleziono pacjenta o takim ID")
+    spec = conn.execute("SELECT id FROM specialists WHERE LOWER(id) = LOWER(?)", (req.specialist_id.strip(),)).fetchone()
+    if not spec:
+        conn.close()
+        raise HTTPException(404, "Nie znaleziono specjalisty o takim ID")
+    conn.execute("UPDATE patients SET specialist_id = ?, status = 'active' WHERE id = ?", (spec["id"], patient_id))
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "specialist_id": spec["id"]}
+
+
+@app.post("/admin/patients/{patient_id}/unassign", dependencies=[Depends(require_admin)])
+def admin_unassign_patient(patient_id: str):
+    """Odpina pacjenta od specjalisty i cofa go do stanu 'pending' (apka pacjenta
+    przestaje wysyłać dane, dopóki ktoś go znów nie przypisze)."""
+    conn = get_db()
+    patient = conn.execute("SELECT id FROM patients WHERE id = ?", (patient_id,)).fetchone()
+    if not patient:
+        conn.close()
+        raise HTTPException(404, "Nie znaleziono pacjenta o takim ID")
+    conn.execute("UPDATE patients SET specialist_id = NULL, status = 'pending' WHERE id = ?", (patient_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+
+_PANEL_CSS = r"""
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 0;
+         background: #f4f5f7; color: #1a1a1a; }
+  .nav { background: #1a1a2e; padding: 0 24px; display: flex; align-items: center; gap: 4px; }
+  .nav .brand { color: #7dd3fc; font-weight: 700; font-size: 14px; margin-right: 20px; padding: 14px 0; }
+  .nav a { color: #ccc; text-decoration: none; font-size: 13px; padding: 14px 14px; border-bottom: 3px solid transparent; }
+  .nav a:hover { color: white; }
+  .nav a.active { color: white; border-bottom-color: #7dd3fc; }
+  .page { padding: 24px; max-width: 1200px; margin: 0 auto; }
+  h2 { font-size: 15px; margin: 0 0 4px; }
+  .banner { background: #1a1a2e; color: white; padding: 16px 20px; border-radius: 10px; margin-bottom: 24px; }
+  .banner .ip { font-family: ui-monospace, monospace; font-size: 22px; font-weight: 700; color: #7dd3fc; letter-spacing: 0.5px; }
+  .banner .label { font-size: 12px; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; }
+  section { margin-bottom: 28px; }
+  .sub { color: #666; font-size: 13px; margin-bottom: 12px; }
+  table { width: 100%; border-collapse: collapse; background: white; border-radius: 8px;
+          overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+  th, td { text-align: left; padding: 8px 14px; font-size: 13px; border-bottom: 1px solid #eee; vertical-align: middle; }
+  th { background: #fafafa; color: #555; font-weight: 600; text-transform: uppercase; font-size: 11px; }
+  tr:last-child td { border-bottom: none; }
+  .role { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .role-pacjent { background: #e3f2fd; color: #1565c0; }
+  .role-specjalista { background: #f3e5f5; color: #6a1b9a; }
+  .role-opiekun { background: #e8f5e9; color: #2e7d32; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot-online { background: #2e7d32; }
+  .dot-offline { background: #bbb; }
+  .mono { font-family: ui-monospace, monospace; font-size: 12px; color: #444; }
+  .empty { padding: 40px; text-align: center; color: #888; background: white; border-radius: 8px; }
+  .muted { color: #999; }
+  .status-ok { color: #2e7d32; font-weight: 600; }
+  .status-err { color: #c62828; font-weight: 600; }
+  .logs-table { max-height: 520px; overflow-y: auto; display: block; }
+  .panel { background: white; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 16px 20px; }
+  .panel input, .toolbar input, .toolbar select, td select { padding: 7px 10px; font-size: 13px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; }
+  .form-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .form-row input { flex: 1; min-width: 160px; }
+  button { background: #1a1a2e; color: white; border: none; padding: 8px 16px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+  button:hover { background: #2a2a4a; }
+  button.secondary { background: #eee; color: #333; }
+  button.secondary:hover { background: #ddd; }
+  .form-msg { font-size: 12px; margin-top: 8px; min-height: 16px; }
+  .form-msg.ok { color: #2e7d32; }
+  .form-msg.err { color: #c62828; }
+  .status-chip { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .status-pending { background: #fff3e0; color: #e65100; }
+  .status-active { background: #e8f5e9; color: #2e7d32; }
+  .btn-sm { background: #eee; color: #333; border: none; padding: 4px 10px; border-radius: 6px; font-size: 11px; cursor: pointer; margin-right: 4px; }
+  .btn-sm:hover { background: #ddd; }
+  .btn-danger { background: #ffebee; color: #c62828; }
+  .btn-danger:hover { background: #ffcdd2; }
+  .btn-warn { background: #fff3e0; color: #e65100; }
+  .btn-warn:hover { background: #ffe0b2; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 20px; }
+  .tab { background: white; color: #333; border: 1px solid #ddd; padding: 8px 18px; border-radius: 20px; font-size: 13px; cursor: pointer; }
+  .tab.active { background: #1a1a2e; color: white; border-color: #1a1a2e; }
+  .toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  .toolbar input { min-width: 240px; }
+  .stats { display: flex; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+  .stat { background: white; border-radius: 8px; padding: 10px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); font-size: 12px; color: #666; }
+  .stat b { display: block; font-size: 20px; color: #1a1a1a; }
+  .warn-banner { background: #fff3e0; color: #8a4b00; border: 1px solid #ffcc80; border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-bottom: 14px; }
+  .sub-row td { background: #fafafa; }
+  .copy { cursor: pointer; }
+  .copy:hover { text-decoration: underline; }
+"""
+
+_COMMON_JS = r"""
+function escapeHtml(s) {
+  return (s === null || s === undefined ? "" : String(s)).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function fmtAgo(sec) {
   if (sec === null || sec === undefined) return "—";
   if (sec < 5) return "przed chwilą";
   if (sec < 60) return sec + " s temu";
   if (sec < 3600) return Math.floor(sec / 60) + " min temu";
   return Math.floor(sec / 3600) + " godz. temu";
-}}
-function fmtTime(iso) {{
+}
+function fmtTime(iso) {
   if (!iso) return "—";
-  const d = new Date(iso);
-  return d.toLocaleTimeString("pl-PL");
-}}
+  return new Date(iso).toLocaleTimeString("pl-PL");
+}
+function fmtDateTime(iso) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleString("pl-PL");
+}
+"""
 
-async function refreshLogs() {{
+
+def _render_panel_page(title: str, active: str, body: str, script: str, server_url: str) -> str:
+    nav = (
+        '<div class="nav"><span class="brand">DEPRESS-SENSE</span>'
+        f'<a href="/dashboard" class="{"active" if active == "dashboard" else ""}">Monitoring serwera</a>'
+        f'<a href="/admin" class="{"active" if active == "admin" else ""}">Użytkownicy</a></div>'
+    )
+    return (
+        '<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8">'
+        f"<title>{title}</title>"
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"<style>{_PANEL_CSS}</style></head><body>{nav}"
+        f'<div class="page">{body}</div><script>{_COMMON_JS}{script}</script></body></html>'
+    ).replace("__SERVER_URL__", escape_html(server_url))
+
+
+def escape_html(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _public_server_url(request: Request) -> str:
+    if PUBLIC_URL:
+        # Serwer zewnętrzny — pokazujemy prawdziwy publiczny adres, a nie lokalny IP
+        # kontenera (który i tak byłby bezużyteczny dla kogokolwiek spoza hosta).
+        return PUBLIC_URL.rstrip("/")
+    ip = get_local_ip()
+    server_info = request.scope.get("server")
+    port = server_info[1] if server_info and server_info[1] else os.environ.get("PORT", "8000")
+    return f"http://{ip}:{port}"
+
+
+_DASHBOARD_BODY = r"""
+  <div class="banner">
+    <div class="label">Serwer DEPRESS-SENSE działa pod adresem</div>
+    <div class="ip">__SERVER_URL__</div>
+    <div class="label" style="margin-top: 6px;">Adres jest zaszyty na stałe w kodzie wszystkich 3 apek — nie trzeba go nigdzie wpisywać.
+      Zarządzanie kontami: zakładka „Użytkownicy”.</div>
+  </div>
+  <section>
+    <h2>Logi żądań (na żywo)</h2>
+    <div class="sub">Każde zapytanie trafiające do serwera. Odświeża się co 2 sekundy.</div>
+    <div id="logs">Ładowanie...</div>
+  </section>
+  <section>
+    <h2>Podpięte urządzenia</h2>
+    <div class="sub">„Online” = kontakt w ciągu ostatnich 60 sekund.</div>
+    <div id="devices">Ładowanie...</div>
+  </section>
+"""
+
+_DASHBOARD_JS = r"""
+async function refreshLogs() {
   const el = document.getElementById("logs");
   let logs;
-  try {{
-    const resp = await fetch("/api/logs");
-    logs = await resp.json();
-  }} catch (e) {{
-    el.innerHTML = '<div class="empty">Błąd połączenia z serwerem.</div>';
-    return;
-  }}
-  if (logs.length === 0) {{
-    el.innerHTML = '<div class="empty">Jeszcze żadnych zapytań.</div>';
-    return;
-  }}
-  let html = '<div class="logs-table"><table><thead><tr>' +
-    '<th>Godzina</th><th>Metoda</th><th>Ścieżka</th><th>Status</th><th>Adres IP</th><th>Czas</th>' +
-    '</tr></thead><tbody>';
-  for (const l of logs) {{
+  try { logs = await (await fetch("/api/logs")).json(); }
+  catch (e) { el.innerHTML = '<div class="empty">Błąd połączenia z serwerem.</div>'; return; }
+  if (!Array.isArray(logs)) { el.innerHTML = '<div class="empty">' + escapeHtml(logs.detail || "Brak dostępu.") + '</div>'; return; }
+  if (logs.length === 0) { el.innerHTML = '<div class="empty">Jeszcze żadnych zapytań.</div>'; return; }
+  let html = '<div class="logs-table"><table><thead><tr><th>Godzina</th><th>Metoda</th><th>Ścieżka</th><th>Status</th><th>Adres IP</th><th>Czas</th></tr></thead><tbody>';
+  for (const l of logs) {
     const statusClass = l.status && l.status < 400 ? "status-ok" : "status-err";
-    html += '<tr>' +
-      '<td class="mono">' + fmtTime(l.time) + '</td>' +
-      '<td class="mono">' + escapeHtml(l.method) + '</td>' +
-      '<td class="mono">' + escapeHtml(l.path) + '</td>' +
-      '<td class="mono ' + statusClass + '">' + escapeHtml(l.status ?? "błąd") + '</td>' +
-      '<td class="mono muted">' + escapeHtml(l.ip) + '</td>' +
-      '<td class="mono muted">' + l.duration_ms + ' ms</td>' +
-      '</tr>';
-  }}
-  html += '</tbody></table></div>';
-  el.innerHTML = html;
-}}
-
-async function refreshDevices() {{
+    html += '<tr><td class="mono">' + fmtTime(l.time) + '</td><td class="mono">' + escapeHtml(l.method) +
+      '</td><td class="mono">' + escapeHtml(l.path) + '</td><td class="mono ' + statusClass + '">' + escapeHtml(l.status ?? "błąd") +
+      '</td><td class="mono muted">' + escapeHtml(l.ip) + '</td><td class="mono muted">' + l.duration_ms + ' ms</td></tr>';
+  }
+  el.innerHTML = html + '</tbody></table></div>';
+}
+async function refreshDevices() {
   const el = document.getElementById("devices");
   let devices;
-  try {{
-    const resp = await fetch("/api/devices");
-    devices = await resp.json();
-  }} catch (e) {{
-    el.innerHTML = '<div class="empty">Błąd połączenia z serwerem.</div>';
-    return;
-  }}
-  if (devices.length === 0) {{
-    el.innerHTML = '<div class="empty">Żadne urządzenie jeszcze się nie odezwało.<br>Uruchom apkę Pacjent, Specjalista albo Opiekun.</div>';
-    return;
-  }}
-  let html = '<table><thead><tr>' +
-    '<th></th><th>Rola</th><th>Device ID</th><th>Model</th><th>Adres IP</th>' +
-    '<th>MAC</th><th>Ostatni kontakt</th><th>Ostatnia akcja</th>' +
-    '</tr></thead><tbody>';
-  for (const d of devices) {{
-    html += '<tr>' +
-      '<td><span class="dot ' + (d.online ? "dot-online" : "dot-offline") + '"></span></td>' +
+  try { devices = await (await fetch("/api/devices")).json(); }
+  catch (e) { el.innerHTML = '<div class="empty">Błąd połączenia z serwerem.</div>'; return; }
+  if (!Array.isArray(devices)) { el.innerHTML = '<div class="empty">' + escapeHtml(devices.detail || "Brak dostępu.") + '</div>'; return; }
+  if (devices.length === 0) { el.innerHTML = '<div class="empty">Żadne urządzenie jeszcze się nie odezwało.<br>Uruchom apkę Pacjent, Specjalista albo Opiekun.</div>'; return; }
+  let html = '<table><thead><tr><th></th><th>Rola</th><th>Device ID</th><th>Model</th><th>Adres IP</th><th>MAC</th><th>Ostatni kontakt</th><th>Ostatnia akcja</th></tr></thead><tbody>';
+  for (const d of devices) {
+    html += '<tr><td><span class="dot ' + (d.online ? "dot-online" : "dot-offline") + '"></span></td>' +
       '<td><span class="role role-' + escapeHtml(d.role) + '">' + escapeHtml(d.role) + '</span></td>' +
-      '<td class="mono">' + escapeHtml(d.device_id.slice(0, 8)) + '…</td>' +
-      '<td>' + escapeHtml(d.model) + '</td>' +
-      '<td class="mono">' + escapeHtml(d.ip_address) + '</td>' +
-      '<td class="mono muted">' + escapeHtml(d.mac_address) + '</td>' +
-      '<td>' + fmtAgo(d.seconds_ago) + '</td>' +
-      '<td class="mono muted">' + escapeHtml(d.last_endpoint) + '</td>' +
-      '</tr>';
-  }}
-  html += '</tbody></table>';
-  el.innerHTML = html;
-}}
-
-async function refreshSpecialists() {{
-  const el = document.getElementById("specialists-list");
-  let specialists;
-  try {{
-    const resp = await fetch("/specialists");
-    specialists = await resp.json();
-  }} catch (e) {{
-    el.innerHTML = '<div class="empty">Błąd połączenia z serwerem.</div>';
-    return;
-  }}
-  if (specialists.length === 0) {{
-    el.innerHTML = '<div class="empty">Żadnego konta specjalisty.</div>';
-    return;
-  }}
-  let html = '<table><thead><tr><th>ID</th><th>Hasło</th><th>Akcje</th></tr></thead><tbody>';
-  for (const s of specialists) {{
-    html += '<tr>' +
-      '<td class="mono">' + escapeHtml(s.id) + '</td>' +
-      '<td>' + (s.must_change_password
-        ? '<span class="status-chip status-pending">wymagana zmiana</span>'
-        : '<span class="status-chip status-active">ustawione</span>') + '</td>' +
-      '<td>' +
-        '<button class="btn-sm btn-warn" onclick="forcePasswordChange(' + JSON.stringify(s.id) + ')">Wymuś zmianę hasła</button>' +
-        '<button class="btn-sm btn-danger" onclick="deleteSpecialist(' + JSON.stringify(s.id) + ')">Usuń</button>' +
-      '</td>' +
-      '</tr>';
-  }}
-  html += '</tbody></table>';
-  el.innerHTML = html;
-}}
-
-async function forcePasswordChange(id) {{
-  if (!confirm('Wymusić zmianę hasła dla "' + id + '" przy następnym logowaniu?')) return;
-  await fetch('/specialists/' + encodeURIComponent(id) + '/force-password-change', {{ method: 'POST' }});
-  refreshSpecialists();
-}}
-
-async function deleteSpecialist(id) {{
-  if (!confirm('Usunąć konto specjalisty "' + id + '"? Jego pacjenci wrócą do stanu "oczekuje na przypisanie".')) return;
-  await fetch('/specialists/' + encodeURIComponent(id), {{ method: 'DELETE' }});
-  refreshSpecialists();
-  refreshAdminPatients();
-}}
-
-async function refreshAdminPatients() {{
-  const el = document.getElementById("admin-patients");
-  let patients;
-  try {{
-    const resp = await fetch("/admin/patients");
-    patients = await resp.json();
-  }} catch (e) {{
-    el.innerHTML = '<div class="empty">Błąd połączenia z serwerem.</div>';
-    return;
-  }}
-  if (patients.length === 0) {{
-    el.innerHTML = '<div class="empty">Żaden pacjent jeszcze się nie zarejestrował.</div>';
-    return;
-  }}
-  let html = '<table><thead><tr>' +
-    '<th>ID</th><th>Status</th><th>Specjalista</th><th>Ostatnia sync.</th><th>Opiekunowie</th><th>Akcje</th>' +
-    '</tr></thead><tbody>';
-  for (const p of patients) {{
-    html += '<tr>' +
-      '<td class="mono">' + escapeHtml(p.id.slice(0, 8)) + '…</td>' +
-      '<td>' + (p.status === 'active'
-        ? '<span class="status-chip status-active">aktywny</span>'
-        : '<span class="status-chip status-pending">oczekuje</span>') + '</td>' +
-      '<td class="mono muted">' + escapeHtml(p.specialist_id || '—') + '</td>' +
-      '<td>' + fmtTime(p.last_sync) + '</td>' +
-      '<td>' + p.caregiver_count + (p.caregiver_count > 0
-        ? ' <button class="btn-sm" onclick="manageCaregivers(' + JSON.stringify(p.id) + ')">zarządzaj</button>' : '') + '</td>' +
-      '<td><button class="btn-sm btn-danger" onclick="deletePatient(' + JSON.stringify(p.id) + ')">Usuń pacjenta</button></td>' +
-      '</tr>';
-  }}
-  html += '</tbody></table>';
-  el.innerHTML = html;
-}}
-
-async function deletePatient(id) {{
-  if (!confirm('Usunąć pacjenta "' + id + '" i WSZYSTKIE jego dane (nieodwracalne)?')) return;
-  await fetch('/admin/patients/' + encodeURIComponent(id), {{ method: 'DELETE' }});
-  refreshAdminPatients();
-}}
-
-async function manageCaregivers(patientId) {{
-  let caregivers;
-  try {{
-    const resp = await fetch('/admin/patients/' + encodeURIComponent(patientId) + '/caregivers');
-    caregivers = await resp.json();
-  }} catch (e) {{
-    alert('Błąd połączenia z serwerem.');
-    return;
-  }}
-  if (caregivers.length === 0) {{
-    alert('Ten pacjent nie ma już żadnych opiekunów.');
-    refreshAdminPatients();
-    return;
-  }}
-  const list = caregivers.map((c, i) => (i + 1) + '. ' + c.caregiver_device_id).join('\\n');
-  const which = prompt('Opiekunowie pacjenta ' + patientId + ':\\n' + list + '\\n\\nWpisz numer, by usunąć (albo anuluj):');
-  const idx = parseInt(which, 10) - 1;
-  if (isNaN(idx) || idx < 0 || idx >= caregivers.length) return;
-  await fetch(
-    '/admin/patients/' + encodeURIComponent(patientId) + '/caregivers/' + encodeURIComponent(caregivers[idx].caregiver_device_id),
-    {{ method: 'DELETE' }},
-  );
-  refreshAdminPatients();
-}}
-
-async function registerSpecialist() {{
-  const idEl = document.getElementById("spec-id");
-  const pwEl = document.getElementById("spec-password");
-  const msgEl = document.getElementById("spec-msg");
-  const id = idEl.value.trim();
-  const password = pwEl.value;
-  msgEl.textContent = "";
-  msgEl.className = "form-msg";
-  if (!id || !password) {{
-    msgEl.textContent = "Podaj ID i hasło.";
-    msgEl.className = "form-msg err";
-    return;
-  }}
-  try {{
-    const resp = await fetch("/specialists/register", {{
-      method: "POST",
-      headers: {{"Content-Type": "application/json"}},
-      body: JSON.stringify({{specialist_id: id, password: password}}),
-    }});
-    if (resp.ok) {{
-      msgEl.textContent = "Dodano konto \\"" + id + "\\".";
-      msgEl.className = "form-msg ok";
-      idEl.value = "";
-      pwEl.value = "";
-      refreshSpecialists();
-    }} else {{
-      const body = await resp.json().catch(() => ({{}}));
-      msgEl.textContent = body.detail || ("Błąd (kod " + resp.status + ").");
-      msgEl.className = "form-msg err";
-    }}
-  }} catch (e) {{
-    msgEl.textContent = "Brak połączenia z serwerem.";
-    msgEl.className = "form-msg err";
-  }}
-}}
-
-function refreshAll() {{ refreshLogs(); refreshDevices(); refreshSpecialists(); refreshAdminPatients(); }}
+      '<td class="mono">' + escapeHtml(d.device_id.slice(0, 8)) + '…</td><td>' + escapeHtml(d.model) + '</td>' +
+      '<td class="mono">' + escapeHtml(d.ip_address) + '</td><td class="mono muted">' + escapeHtml(d.mac_address) + '</td>' +
+      '<td>' + fmtAgo(d.seconds_ago) + '</td><td class="mono muted">' + escapeHtml(d.last_endpoint) + '</td></tr>';
+  }
+  el.innerHTML = html + '</tbody></table>';
+}
+function refreshAll() { refreshLogs(); refreshDevices(); }
 refreshAll();
 setInterval(refreshAll, 2000);
-</script>
-</body>
-</html>
 """
+
+_ADMIN_BODY = r"""
+  <div class="tabs">
+    <button class="tab active" data-tab="specialists">Specjaliści</button>
+    <button class="tab" data-tab="patients">Pacjenci i opiekunowie</button>
+  </div>
+
+  <div id="tab-specialists">
+    <section>
+      <h2>Dodaj specjalistę</h2>
+      <div class="sub">ID + hasło startowe do logowania w apce Specjalisty (min. 8 znaków). Nowe konto wymusza zmianę hasła przy pierwszym logowaniu.</div>
+      <div class="panel">
+        <div class="form-row">
+          <input id="spec-id" type="text" placeholder="ID specjalisty (np. jkowalski)" autocomplete="off">
+          <input id="spec-password" type="text" placeholder="Hasło startowe (min. 8 znaków)" autocomplete="off">
+          <button class="secondary" id="gen-password" type="button">Generuj hasło</button>
+          <button id="add-specialist" type="button">Dodaj specjalistę</button>
+        </div>
+        <div id="spec-msg" class="form-msg"></div>
+      </div>
+    </section>
+    <section>
+      <h2>Konta specjalistów</h2>
+      <div id="specialists-warning"></div>
+      <div id="specialists-list">Ładowanie...</div>
+    </section>
+  </div>
+
+  <div id="tab-patients" style="display:none">
+    <section>
+      <h2>Pacjenci</h2>
+      <div class="sub">Wszyscy zarejestrowani uczestnicy. „Oczekuje” = jeszcze nieprzypisany do żadnego specjalisty — apka pacjenta nie wysyła wtedy danych.
+        Wybierz specjalistę z listy, aby przypisać (i aktywować) pacjenta; „— brak —” odpina go.</div>
+      <div class="stats" id="patient-stats"></div>
+      <div class="toolbar">
+        <input id="patient-search" type="search" placeholder="Szukaj po ID, nazwie lub specjaliście…">
+        <select id="patient-filter">
+          <option value="all">Wszyscy</option>
+          <option value="pending">Tylko oczekujący</option>
+          <option value="active">Tylko aktywni</option>
+        </select>
+        <button class="secondary" id="patients-refresh" type="button">Odśwież</button>
+      </div>
+      <div id="admin-patients">Ładowanie...</div>
+    </section>
+  </div>
+"""
+
+_ADMIN_JS = r"""
+let specialists = [];
+let patients = [];
+const openCaregivers = new Set();
+
+async function call(method, path, body) {
+  const opts = { method, headers: {} };
+  if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+  try {
+    const resp = await fetch(path, opts);
+    let data = null;
+    try { data = await resp.json(); } catch (e) {}
+    return { ok: resp.ok, status: resp.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { detail: "Brak połączenia z serwerem." } };
+  }
+}
+function errText(r) { return (r.data && r.data.detail) || ("Błąd (kod " + r.status + ")."); }
+
+// --- zakładki
+document.querySelectorAll(".tab").forEach(btn => btn.addEventListener("click", () => showTab(btn.dataset.tab)));
+function showTab(name) {
+  document.querySelectorAll(".tab").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+  document.getElementById("tab-specialists").style.display = name === "specialists" ? "" : "none";
+  document.getElementById("tab-patients").style.display = name === "patients" ? "" : "none";
+  if (location.hash !== "#" + name) history.replaceState(null, "", "#" + name);
+}
+
+// --- specjaliści
+async function refreshSpecialists() {
+  const el = document.getElementById("specialists-list");
+  const r = await call("GET", "/specialists");
+  if (!r.ok) { el.innerHTML = '<div class="empty">' + escapeHtml(errText(r)) + '</div>'; return; }
+  specialists = r.data;
+  document.getElementById("specialists-warning").innerHTML = specialists.some(s => s.default_credentials)
+    ? '<div class="warn-banner">⚠ Konto testowe <b>spec001</b> nadal ma domyślne, publicznie znane hasło. Zresetuj je albo usuń to konto, zanim serwer zacznie obsługiwać realnych uczestników.</div>' : "";
+  if (specialists.length === 0) { el.innerHTML = '<div class="empty">Żadnego konta specjalisty.</div>'; renderPatients(); return; }
+  let html = '<table><thead><tr><th>ID</th><th>Pacjenci</th><th>Hasło</th><th>Akcje</th></tr></thead><tbody>';
+  for (const s of specialists) {
+    html += '<tr><td class="mono">' + escapeHtml(s.id) + '</td><td>' + s.patient_count + '</td><td>' +
+      (s.must_change_password ? '<span class="status-chip status-pending">wymagana zmiana</span>' : '<span class="status-chip status-active">ustawione</span>') +
+      '</td><td>' +
+      '<button class="btn-sm" data-action="reset-pw" data-id="' + escapeHtml(s.id) + '">Ustaw nowe hasło</button>' +
+      '<button class="btn-sm btn-warn" data-action="force-pw" data-id="' + escapeHtml(s.id) + '">Wymuś zmianę hasła</button>' +
+      '<button class="btn-sm btn-danger" data-action="delete-spec" data-id="' + escapeHtml(s.id) + '">Usuń</button></td></tr>';
+  }
+  el.innerHTML = html + '</tbody></table>';
+  renderPatients();
+}
+
+function randomPassword() {
+  const chars = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const bytes = new Uint32Array(14);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, b => chars[b % chars.length]).join("");
+}
+document.getElementById("gen-password").addEventListener("click", () => { document.getElementById("spec-password").value = randomPassword(); });
+document.getElementById("add-specialist").addEventListener("click", async () => {
+  const idEl = document.getElementById("spec-id"), pwEl = document.getElementById("spec-password"), msgEl = document.getElementById("spec-msg");
+  const id = idEl.value.trim(), password = pwEl.value;
+  msgEl.className = "form-msg";
+  if (!id || !password) { msgEl.textContent = "Podaj ID i hasło."; msgEl.className = "form-msg err"; return; }
+  const r = await call("POST", "/specialists/register", { specialist_id: id, password });
+  if (r.ok) {
+    msgEl.textContent = 'Dodano konto „' + id + '”. Hasło startowe: ' + password + ' (przekaż je specjaliście — przy pierwszym logowaniu będzie musiał je zmienić).';
+    msgEl.className = "form-msg ok";
+    idEl.value = ""; pwEl.value = "";
+    refreshSpecialists();
+  } else { msgEl.textContent = errText(r); msgEl.className = "form-msg err"; }
+});
+
+// --- pacjenci
+async function refreshPatients() {
+  const el = document.getElementById("admin-patients");
+  const r = await call("GET", "/admin/patients");
+  if (!r.ok) { el.innerHTML = '<div class="empty">' + escapeHtml(errText(r)) + '</div>'; return; }
+  patients = r.data;
+  renderPatients();
+}
+
+function renderPatients() {
+  const el = document.getElementById("admin-patients");
+  const active = patients.filter(p => p.status === "active").length;
+  document.getElementById("patient-stats").innerHTML =
+    '<div class="stat"><b>' + patients.length + '</b>wszyscy</div>' +
+    '<div class="stat"><b>' + active + '</b>aktywni</div>' +
+    '<div class="stat"><b>' + (patients.length - active) + '</b>oczekujący</div>' +
+    '<div class="stat"><b>' + patients.reduce((a, p) => a + p.caregiver_count, 0) + '</b>opiekunów łącznie</div>';
+  const q = document.getElementById("patient-search").value.trim().toLowerCase();
+  const filter = document.getElementById("patient-filter").value;
+  const rows = patients.filter(p =>
+    (filter === "all" || p.status === filter) &&
+    (!q || [p.id, p.name, p.specialist_id].some(v => (v || "").toLowerCase().includes(q))));
+  if (patients.length === 0) { el.innerHTML = '<div class="empty">Żaden pacjent jeszcze się nie zarejestrował.</div>'; return; }
+  if (rows.length === 0) { el.innerHTML = '<div class="empty">Brak pacjentów spełniających filtr.</div>'; return; }
+  let html = '<table><thead><tr><th>ID pacjenta</th><th>Nazwa</th><th>Status</th><th>Specjalista</th><th>Ostatnia sync.</th><th>Opiekunowie</th><th>Akcje</th></tr></thead><tbody>';
+  for (const p of rows) {
+    const options = ['<option value="">— brak —</option>'].concat(specialists.map(s =>
+      '<option value="' + escapeHtml(s.id) + '"' + (s.id === p.specialist_id ? " selected" : "") + '>' + escapeHtml(s.id) + '</option>')).join("");
+    html += '<tr><td class="mono copy" title="Kliknij, aby skopiować" data-action="copy" data-id="' + escapeHtml(p.id) + '">' + escapeHtml(p.id.slice(0, 13)) + '…</td>' +
+      '<td>' + escapeHtml(p.name || "—") + '</td>' +
+      '<td>' + (p.status === "active" ? '<span class="status-chip status-active">aktywny</span>' : '<span class="status-chip status-pending">oczekuje</span>') + '</td>' +
+      '<td><select data-assign="' + escapeHtml(p.id) + '">' + options + '</select></td>' +
+      '<td>' + fmtDateTime(p.last_sync) + '</td>' +
+      '<td>' + p.caregiver_count + (p.caregiver_count > 0 ? ' <button class="btn-sm" data-action="toggle-cg" data-id="' + escapeHtml(p.id) + '">' + (openCaregivers.has(p.id) ? "ukryj" : "zarządzaj") + '</button>' : '') + '</td>' +
+      '<td><button class="btn-sm btn-danger" data-action="delete-patient" data-id="' + escapeHtml(p.id) + '">Usuń pacjenta</button></td></tr>';
+    if (openCaregivers.has(p.id)) html += '<tr class="sub-row"><td colspan="7" id="cg-' + escapeHtml(p.id) + '">Ładowanie opiekunów…</td></tr>';
+  }
+  el.innerHTML = html + '</tbody></table>';
+  for (const id of openCaregivers) loadCaregivers(id);
+}
+
+async function loadCaregivers(patientId) {
+  const cell = document.getElementById("cg-" + patientId);
+  if (!cell) return;
+  const r = await call("GET", "/admin/patients/" + encodeURIComponent(patientId) + "/caregivers");
+  if (!r.ok) { cell.textContent = errText(r); return; }
+  if (r.data.length === 0) { cell.textContent = "Ten pacjent nie ma opiekunów."; return; }
+  cell.innerHTML = 'Opiekunowie (device ID): ' + r.data.map(c =>
+    '<span class="mono">' + escapeHtml(c.caregiver_device_id) + '</span> <button class="btn-sm btn-danger" data-action="remove-cg" data-id="' + escapeHtml(patientId) +
+    '" data-cg="' + escapeHtml(c.caregiver_device_id) + '">Odłącz</button>').join(" &nbsp; ");
+}
+
+document.getElementById("patient-search").addEventListener("input", renderPatients);
+document.getElementById("patient-filter").addEventListener("change", renderPatients);
+document.getElementById("patients-refresh").addEventListener("click", refreshPatients);
+
+document.addEventListener("change", async (ev) => {
+  const sel = ev.target.closest("select[data-assign]");
+  if (!sel) return;
+  const patientId = sel.dataset.assign;
+  const r = sel.value
+    ? await call("POST", "/admin/patients/" + encodeURIComponent(patientId) + "/assign", { specialist_id: sel.value })
+    : await call("POST", "/admin/patients/" + encodeURIComponent(patientId) + "/unassign");
+  if (!r.ok) alert(errText(r));
+  await refreshPatients();
+  refreshSpecialists();
+});
+
+// --- akcje przyciskowe (delegacja zdarzeń)
+document.addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("[data-action]");
+  if (!btn) return;
+  const id = btn.dataset.id;
+  switch (btn.dataset.action) {
+    case "copy":
+      try { await navigator.clipboard.writeText(id); btn.textContent = "skopiowano ✓"; setTimeout(renderPatients, 900); } catch (e) { prompt("ID pacjenta:", id); }
+      break;
+    case "force-pw":
+      if (!confirm('Wymusić zmianę hasła dla „' + id + '” przy następnym logowaniu?')) return;
+      { const r = await call("POST", "/specialists/" + encodeURIComponent(id) + "/force-password-change"); if (!r.ok) alert(errText(r)); }
+      refreshSpecialists(); break;
+    case "reset-pw": {
+      const suggestion = randomPassword();
+      const pw = prompt('Nowe hasło dla „' + id + '” (min. 8 znaków; przy logowaniu zostanie wymuszona jego zmiana):', suggestion);
+      if (!pw) return;
+      const r = await call("POST", "/admin/specialists/" + encodeURIComponent(id) + "/reset-password", { new_password: pw });
+      alert(r.ok ? 'Hasło ustawione. Przekaż je specjaliście: ' + pw : errText(r));
+      refreshSpecialists(); break;
+    }
+    case "delete-spec":
+      if (!confirm('Usunąć konto specjalisty „' + id + '”? Jego pacjenci wrócą do stanu „oczekuje”.')) return;
+      { const r = await call("DELETE", "/specialists/" + encodeURIComponent(id)); if (!r.ok) alert(errText(r)); }
+      await refreshPatients(); refreshSpecialists(); break;
+    case "delete-patient":
+      if (!confirm('Usunąć pacjenta ' + id + ' i WSZYSTKIE jego dane (pomiary, samooceny, PHQ-9, MADRS, opiekunowie)? Operacja jest nieodwracalna.')) return;
+      { const r = await call("DELETE", "/admin/patients/" + encodeURIComponent(id)); if (!r.ok) alert(errText(r)); }
+      openCaregivers.delete(id);
+      await refreshPatients(); refreshSpecialists(); break;
+    case "toggle-cg":
+      if (openCaregivers.has(id)) openCaregivers.delete(id); else openCaregivers.add(id);
+      renderPatients(); break;
+    case "remove-cg":
+      if (!confirm('Odłączyć tego opiekuna od pacjenta?')) return;
+      { const r = await call("DELETE", "/admin/patients/" + encodeURIComponent(id) + "/caregivers/" + encodeURIComponent(btn.dataset.cg)); if (!r.ok) alert(errText(r)); }
+      await refreshPatients(); break;
+  }
+});
+
+showTab(location.hash === "#patients" ? "patients" : "specialists");
+refreshSpecialists().then(refreshPatients);
+// Odświeżanie w tle co 15 s — pomijane, gdy admin akurat wybiera coś z listy/pisze w polu.
+setInterval(() => {
+  const a = document.activeElement;
+  if (a && (a.tagName === "SELECT" || a.tagName === "INPUT")) return;
+  refreshPatients(); refreshSpecialists();
+}, 15000);
+"""
+
+
+@app.get("/dashboard", response_class=HTMLResponse, dependencies=[Depends(require_admin)])
+def dashboard(request: Request):
+    """Monitoring serwera na żywo (adres, logi żądań, urządzenia). Zarządzanie
+    użytkownikami jest teraz osobno, na /admin."""
+    return _render_panel_page(
+        "DEPRESS-SENSE — monitoring", "dashboard", _DASHBOARD_BODY, _DASHBOARD_JS, _public_server_url(request),
+    )
+
+
+@app.get("/admin", response_class=HTMLResponse, dependencies=[Depends(require_admin)])
+def admin_panel(request: Request):
+    """Osobny panel do dodawania użytkowników i operacji na nich (specjaliści,
+    pacjenci, opiekunowie)."""
+    return _render_panel_page(
+        "DEPRESS-SENSE — użytkownicy", "admin", _ADMIN_BODY, _ADMIN_JS, _public_server_url(request),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Uruchomienie bezpośrednio (`python main.py`, np. przyciskiem "Run" w IDE).
+# Do tej pory plik nie miał tego bloku, więc odpalenie w ten sposób (bez
+# wpisywania komendy `uvicorn main:app ...` w terminalu) po prostu definiowało
+# `app` i kończyło proces (exit code 0) bez wystartowania serwera — wyglądało
+# to tak, jakby serwer "działał", ale w rzeczywistości nic nie nasłuchiwało.
+# Udokumentowana komenda `uvicorn main:app --host 0.0.0.0 --port 8000`
+# (README.md, komenda startowa na Railway) działa tak jak dotychczas —
+# ten blok tylko dodaje DRUGĄ, równoważną drogę startu, przydatną lokalnie.
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "8000")),
+    )
