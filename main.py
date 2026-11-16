@@ -29,6 +29,8 @@ from typing import Optional
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi import Response
+
+import push
 from pydantic import BaseModel, Field
 
 # Ścieżkę do pliku bazy można nadpisać zmienną środowiskową DEPRESS_SENSE_DB_PATH —
@@ -464,6 +466,7 @@ def _migrate_existing_columns():
 
 
 init_db()
+push.init(get_db)
 
 
 def now_iso() -> str:
@@ -900,15 +903,26 @@ def submit_phq9(patient_id: str, req: Phq9Request):
     severity = phq9_severity(total_score)
     safety_flag = req.item9 > 0
     ts = now_iso()
-    conn.execute(
+    cur = conn.execute(
         """INSERT INTO phq9_responses
            (patient_id, timestamp, item1, item2, item3, item4, item5, item6, item7, item8, item9,
             total_score, severity, safety_flag, safety_reviewed)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
         (patient_id, ts, *items, total_score, severity, int(safety_flag)),
     )
+    entry_id = cur.lastrowid
+    spec_row = conn.execute("SELECT specialist_id FROM patients WHERE id = ?", (patient_id,)).fetchone()
     conn.commit()
     conn.close()
+    if safety_flag:
+        # NATYCHMIASTOWY push (apka nie musi być otwarta): specjalista + opiekunowie pacjenta.
+        # W wiadomości tylko typ i identyfikatory — bez wyniku i bez nazwy pacjenta.
+        if spec_row and spec_row["specialist_id"]:
+            push.notify("specjalista", spec_row["specialist_id"],
+                        {"type": "safety", "patient_id": patient_id, "entry_id": entry_id},
+                        dedupe_key=f"safety:{entry_id}")
+        push.notify("opiekun", patient_id, {"type": "safety_escalation", "patient_id": patient_id},
+                    dedupe_key=f"safety-cg:{entry_id}")
     # safety_flag w odpowiedzi steruje tym, czy apka Pacjenta natychmiast pokaże
     # komunikat bezpieczeństwa + numer 112 (patrz SafetyMessageScreen.kt) — bez
     # czekania na żadną interpretację serwera, zgodnie z procedurą bezpieczeństwa.
@@ -1569,6 +1583,44 @@ async def _background_stats_refresher():
         await asyncio.sleep(BACKGROUND_STATS_INTERVAL_SECONDS)
 
 
+PUSH_CHECK_INTERVAL_SECONDS = 300
+
+
+def _check_change_alerts_and_push():
+    """Co kilka minut sprawdza modele zmian zachowania i wysyła push do specjalisty, gdy
+    pacjent NOWO przekroczył próg (trwała zmiana) albo zniknął (>48 h bez synchronizacji).
+    Dedupikacja po kluczu (pacjent + od kiedy), więc ta sama sytuacja = jeden push."""
+    if not push.configured():
+        return
+    conn = get_db()
+    patients = conn.execute(
+        "SELECT id, specialist_id FROM patients WHERE specialist_id IS NOT NULL AND specialist_id != '' AND status = 'active'"
+    ).fetchall()
+    conn.close()
+    for p in patients:
+        result = _compute_change_detection(p["id"])
+        if not result:
+            continue
+        if result.get("flagged") and result.get("flagged_since"):
+            push.notify("specjalista", p["specialist_id"], {"type": "change", "patient_id": p["id"]},
+                        dedupe_key=f"change:{p['id']}:{result['flagged_since']}")
+        if result.get("disappeared"):
+            # klucz po dniu ostatniej synchronizacji: jedno powiadomienie na jedno "zniknięcie"
+            last = (result.get("last_sync") or "")[:10]
+            push.notify("specjalista", p["specialist_id"], {"type": "gone", "patient_id": p["id"]},
+                        dedupe_key=f"gone:{p['id']}:{last}")
+
+
+async def _background_push_checker():
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await asyncio.to_thread(_check_change_alerts_and_push)
+        except Exception as e:
+            print(f"[push] checker: {e}")
+        await asyncio.sleep(PUSH_CHECK_INTERVAL_SECONDS)
+
+
 # ---------------------------------------------------------------------------
 # RYTM DOBOWY — profil aktywności wg godziny doby, przeliczany najwyżej raz na
 # dobę, z 15% tolerancją zmiany między kolejnymi dniami
@@ -1700,6 +1752,7 @@ def _maybe_open_dashboard_in_browser():
 async def on_startup():
     _maybe_open_dashboard_in_browser()
     asyncio.create_task(_background_stats_refresher())
+    asyncio.create_task(_background_push_checker())
 
 
 # ---------------------------------------------------------------------------
@@ -1950,6 +2003,7 @@ def admin_delete_patient(patient_id: str):
         "self_assessments", "phq9_responses", "madrs_assessments",
     ):
         conn.execute(f"DELETE FROM {table} WHERE patient_id = ?", (patient_id,))
+    conn.execute("DELETE FROM push_tokens WHERE user_id = ? AND role IN ('pacjent', 'opiekun')", (patient_id,))
     conn.execute("DELETE FROM patients WHERE id = ?", (patient_id,))
     conn.commit()
     conn.close()
@@ -1991,6 +2045,53 @@ def list_patients(specialist_id: str):
     ).fetchall()
     conn.close()
     return [{"id": r["id"], "name": r["name"], "flag": bool(r["flag"]), "last_sync": r["last_sync"]} for r in rows]
+
+
+class PushRegisterRequest(BaseModel):
+    role: str
+    user_id: str
+    token: str
+
+
+class PushUnregisterRequest(BaseModel):
+    token: str
+
+
+@app.post("/push/register")
+def push_register(req: PushRegisterRequest):
+    """Apka zgłasza swój token FCM (po instalacji, po zmianie tokenu, po zalogowaniu).
+    Rola: pacjent (user_id = id pacjenta), specjalista (id specjalisty), opiekun (id
+    podopiecznego). Uwaga: jak pozostałe endpointy apek — bez uwierzytelnienia (Faza 12)."""
+    try:
+        push.register_token(req.role, req.user_id.strip(), req.token.strip())
+    except ValueError:
+        raise HTTPException(400, "Nieprawidłowe dane rejestracji push")
+    return {"status": "ok"}
+
+
+@app.post("/push/unregister")
+def push_unregister(req: PushUnregisterRequest):
+    push.unregister_token(req.token.strip())
+    return {"status": "ok"}
+
+
+@app.get("/admin/push-status", dependencies=[Depends(require_admin)])
+def admin_push_status():
+    return {"configured": push.configured(), "tokens": push.token_counts()}
+
+
+@app.get("/specialists/{specialist_id}/unassigned-patients")
+def list_unassigned_patients(specialist_id: str):
+    """Pacjenci, którzy uruchomili apkę, ale nie mają jeszcze specjalisty (status 'pending')
+    — żeby specjalista mógł wybrać ID z listy zamiast je przepisywać. Zwraca tylko
+    ID i czas rejestracji, żadnych danych."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, last_sync FROM patients WHERE (specialist_id IS NULL OR specialist_id = '') "
+        "AND status = 'pending' ORDER BY last_sync DESC LIMIT 50"
+    ).fetchall()
+    conn.close()
+    return [{"id": r["id"], "registered_at": r["last_sync"]} for r in rows]
 
 
 @app.post("/specialists/{specialist_id}/patients")
@@ -2042,12 +2143,15 @@ def specialist_contact_patient(patient_id: str):
     if not row:
         conn.close()
         raise HTTPException(404, "Nieznany pacjent")
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO messages (patient_id, direction, status, created_at) VALUES (?, 'to_patient', 'pending', ?)",
         (patient_id, now_iso()),
     )
+    message_id = cur.lastrowid
     conn.commit()
     conn.close()
+    push.notify("pacjent", patient_id, {"type": "contact", "message_id": message_id},
+                dedupe_key=f"contact:{message_id}")
     return {"status": "ok"}
 
 
@@ -2089,12 +2193,18 @@ def caregiver_contact_specialist(patient_id: str):
         conn.close()
         raise HTTPException(404, "Nieznany pacjent")
     conn.execute("UPDATE patients SET flag = 1 WHERE id = ?", (patient_id,))
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO messages (patient_id, direction, status, created_at) VALUES (?, 'to_specialist', 'pending', ?)",
         (patient_id, now_iso()),
     )
+    message_id = cur.lastrowid
+    spec_row = conn.execute("SELECT specialist_id FROM patients WHERE id = ?", (patient_id,)).fetchone()
     conn.commit()
     conn.close()
+    if spec_row and spec_row["specialist_id"]:
+        push.notify("specjalista", spec_row["specialist_id"],
+                    {"type": "contact_request", "patient_id": patient_id},
+                    dedupe_key=f"cgcontact:{message_id}")
     return {"status": "ok"}
 
 

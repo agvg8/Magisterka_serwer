@@ -307,3 +307,20 @@ Basic nie dało się wylogować). Sesja administratora: ciasteczko sesyjne (znik
 przeglądarki), wygasa po 15 min bezczynności, przycisk **Wyloguj** w pasku `/admin` i `/dashboard`
 unieważnia ją na serwerze. Panel specjalisty `/specjalista`: sesja wygasa po 30 min bezczynności,
 też bez trwałego ciasteczka; pola logowania mają wyłączone podpowiadanie haseł.
+
+### Nieprzypisani pacjenci i powiadomienia przeglądarkowe (2026-11-16)
+
+- `GET /specialists/{id}/unassigned-patients` oraz `GET /portal/api/unassigned` — pacjenci ze statusem
+  `pending` bez specjalisty (tylko ID i czas rejestracji). W portalu pod polem „ID pacjenta” jest lista
+  z przyciskiem „Dodaj”; w apce Specjalisty okno „Dodaj pacjenta” podpowiada te ID.
+- Portal: przycisk „Włącz powiadomienia” (Notification API). Co 30 s sprawdza nowe alerty bezpieczeństwa,
+  zmiany zachowania i nowych pacjentów; każde zdarzenie zgłasza raz. Działa przy otwartej karcie panelu.
+
+### Push (FCM) — powiadomienia przy zamkniętych apkach (2026-11-16)
+
+Nowy moduł `push.py` (Firebase Cloud Messaging HTTP v1), tabele `push_tokens`/`push_sent`, endpointy
+`POST /push/register`, `POST /push/unregister`, `GET /admin/push-status`. Wyzwalacze: PHQ-9 z flagą
+bezpieczeństwa (specjalista + opiekunowie), zmiana zachowania / brak kontaktu (kontrola co 5 min),
+prośba opiekuna, kontakt od specjalisty do pacjenta. Konfiguracja:
+`FIREBASE_SETUP.md` (zmienna `DEPRESS_SENSE_FCM_SERVICE_ACCOUNT`). Bez niej push jest wyłączony, reszta działa.
+Nowe zależności: `google-auth`, `requests`.

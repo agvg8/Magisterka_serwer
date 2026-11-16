@@ -349,6 +349,16 @@ def setup(app, ns: dict):
         own_patient(sess, patient_id)
         return get_patient_trends(patient_id, days)
 
+    @router.get("/unassigned")
+    def unassigned(sess: dict = Depends(session_ready)):
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT id, last_sync FROM patients WHERE (specialist_id IS NULL OR specialist_id = '') "
+            "AND status = 'pending' ORDER BY last_sync DESC LIMIT 50"
+        ).fetchall()
+        conn.close()
+        return [{"id": r["id"], "registered_at": r["last_sync"]} for r in rows]
+
     @router.post("/patients")
     def add_patient(req: PortalAddPatient, sess: dict = Depends(session_ready)):
         pid = req.patient_id.strip()
