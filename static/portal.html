@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<title>DEPRESS-SENSE — panel specjalisty</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #f3f7f9; --surface: #ffffff; --text: #16323a; --muted: #5f7780; --border: #e1eaee;
+    --primary: #0e7c86; --primary-dark: #0a5a62; --primary-soft: #e3f4f5;
+    --ok: #2e9e6b; --ok-soft: #e4f6ec; --warn: #c9861a; --warn-soft: #fdf1dc;
+    --danger: #d64545; --danger-soft: #fdeaea; --info-soft: #e8f0fb; --info: #3b6fb6;
+    --radius: 14px; --shadow: 0 1px 2px rgba(22,50,58,.06), 0 4px 14px rgba(22,50,58,.05);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg);
+         color: var(--text); font-size: 14px; line-height: 1.45; }
+  h1, h2, h3 { margin: 0; font-weight: 650; }
+  h1 { font-size: 22px; } h2 { font-size: 16px; } h3 { font-size: 14px; }
+  button { font: inherit; cursor: pointer; }
+  .hidden { display: none !important; }
+
+  /* --- logowanie --- */
+  .auth-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+  .auth-card { background: var(--surface); width: 100%; max-width: 400px; border-radius: 18px; box-shadow: var(--shadow);
+               padding: 32px; border-top: 5px solid var(--primary); }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; color: var(--primary-dark); font-size: 17px; }
+  .brand .logo { width: 34px; height: 34px; border-radius: 10px; background: var(--primary); color: #fff;
+                 display: grid; place-items: center; font-size: 18px; }
+  .auth-card p.lead { color: var(--muted); margin: 14px 0 22px; }
+  label.field { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 14px; }
+  label.field input, .input { display: block; width: 100%; margin-top: 5px; padding: 10px 12px; font: inherit; color: var(--text);
+                              border: 1px solid var(--border); border-radius: 10px; background: #fbfdfd; }
+  label.field input:focus, .input:focus { outline: 2px solid var(--primary-soft); border-color: var(--primary); }
+  .btn { background: var(--primary); color: #fff; border: none; padding: 10px 18px; border-radius: 10px; font-weight: 600; }
+  .btn:hover { background: var(--primary-dark); }
+  .btn.block { width: 100%; }
+  .btn.secondary { background: var(--primary-soft); color: var(--primary-dark); }
+  .btn.secondary:hover { background: #cfeaec; }
+  .btn.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+  .btn.ghost:hover { background: #f1f6f8; }
+  .btn.danger { background: var(--danger-soft); color: var(--danger); }
+  .btn.small { padding: 6px 12px; font-size: 12.5px; border-radius: 8px; }
+  .form-error { color: var(--danger); font-size: 13px; min-height: 18px; margin: 4px 0 10px; }
+
+  /* --- układ --- */
+  .topbar { background: var(--surface); border-bottom: 1px solid var(--border); height: 60px; padding: 0 24px;
+            display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 20; }
+  .topbar .who { display: flex; align-items: center; gap: 14px; color: var(--muted); font-size: 13px; }
+  .layout { display: flex; min-height: calc(100vh - 60px); }
+  .sidebar { width: 226px; padding: 18px 12px; background: var(--surface); border-right: 1px solid var(--border); flex-shrink: 0; }
+  .nav-item { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 10px 12px; margin-bottom: 4px;
+              border: none; background: none; border-radius: 10px; color: var(--text); text-align: left; font-weight: 550; }
+  .nav-item:hover { background: #f1f6f8; }
+  .nav-item.active { background: var(--primary-soft); color: var(--primary-dark); }
+  .nav-badge { background: var(--danger); color: #fff; border-radius: 10px; font-size: 11px; padding: 1px 7px; font-weight: 700; }
+  .nav-badge.soft { background: var(--warn); }
+  .content { flex: 1; padding: 26px 30px 50px; max-width: 1280px; min-width: 0; }
+  .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-bottom: 20px; }
+  .page-head .sub { color: var(--muted); margin-top: 3px; }
+  .disclaimer { color: var(--muted); font-size: 12px; margin-top: 34px; padding-top: 14px; border-top: 1px solid var(--border); }
+
+  /* --- karty --- */
+  .grid { display: grid; gap: 16px; }
+  .kpis { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); margin-bottom: 20px; }
+  .two { grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
+  .three { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .card { background: var(--surface); border-radius: var(--radius); box-shadow: var(--shadow); padding: 18px 20px; min-width: 0; }
+  .card h2 { margin-bottom: 4px; } .card .hint { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+  .kpi .num { font-size: 28px; font-weight: 700; line-height: 1.1; margin-top: 6px; }
+  .kpi .lbl { color: var(--muted); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }
+  .kpi.alert-danger { background: var(--danger-soft); } .kpi.alert-danger .num { color: var(--danger); }
+  .kpi.alert-warn { background: var(--warn-soft); } .kpi.alert-warn .num { color: var(--warn); }
+  .chart-box { position: relative; height: 260px; } .chart-box.tall { height: 320px; }
+  .section-title { margin: 26px 0 12px; display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+
+  /* --- chipy, tabele --- */
+  .chip { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 11.5px; font-weight: 650; white-space: nowrap; }
+  .chip.ok { background: var(--ok-soft); color: var(--ok); } .chip.warn { background: var(--warn-soft); color: var(--warn); }
+  .chip.danger { background: var(--danger-soft); color: var(--danger); } .chip.info { background: var(--info-soft); color: var(--info); }
+  .chip.gray { background: #eef2f4; color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 650;
+       padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  td { padding: 12px 14px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  tr.clickable { cursor: pointer; } tr.clickable:hover td { background: #f7fbfc; }
+  tr:last-child td { border-bottom: none; }
+  .table-card { padding: 4px 6px; overflow-x: auto; }
+  .muted { color: var(--muted); } .mono { font-family: ui-monospace, monospace; font-size: 12px; }
+  .toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+  .toolbar .input { margin: 0; width: auto; min-width: 240px; }
+  .empty { padding: 36px; text-align: center; color: var(--muted); }
+
+  /* --- szczegóły pacjenta --- */
+  .back { background: none; border: none; color: var(--primary-dark); font-weight: 600; padding: 0; margin-bottom: 10px; }
+  .banner { border-radius: var(--radius); padding: 14px 18px; margin-bottom: 16px; display: flex; gap: 14px; align-items: center;
+            justify-content: space-between; flex-wrap: wrap; }
+  .banner.danger { background: var(--danger-soft); border: 1px solid #f3c4c4; }
+  .banner.warn { background: var(--warn-soft); border: 1px solid #f1d9a8; }
+  .banner.info { background: var(--info-soft); border: 1px solid #c9daf3; }
+  .banner b { display: block; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .tiles { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+  .tile { background: var(--surface); border-radius: 12px; box-shadow: var(--shadow); padding: 14px 16px; }
+  .tile .t-lbl { color: var(--muted); font-size: 12px; font-weight: 600; min-height: 32px; }
+  .tile .t-val { font-size: 22px; font-weight: 700; margin-top: 2px; }
+  .tile .t-val small { font-size: 12px; font-weight: 500; color: var(--muted); }
+  .tile .t-trend { font-size: 12px; margin-top: 2px; color: var(--muted); }
+  .bar { height: 8px; background: #e8eff2; border-radius: 6px; overflow: hidden; margin: 4px 0 10px; }
+  .bar > span { display: block; height: 100%; background: var(--primary); border-radius: 6px; }
+  .kv { display: flex; justify-content: space-between; font-size: 13px; }
+  .big { font-size: 30px; font-weight: 700; } .big small { font-size: 14px; color: var(--muted); font-weight: 500; }
+  .tabs { display: inline-flex; background: #e8eff2; padding: 3px; border-radius: 10px; gap: 2px; }
+  .tabs button { border: none; background: none; padding: 6px 14px; border-radius: 8px; color: var(--muted); font-weight: 600; }
+  .tabs button.active { background: var(--surface); color: var(--primary-dark); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+  .mini-table td, .mini-table th { padding: 7px 8px; font-size: 12.5px; }
+
+  /* --- modal, toast --- */
+  .backdrop { position: fixed; inset: 0; background: rgba(22,50,58,.45); display: flex; align-items: flex-start; justify-content: center;
+              padding: 40px 16px; overflow-y: auto; z-index: 50; }
+  .modal { background: var(--surface); border-radius: 16px; max-width: 640px; width: 100%; padding: 24px; box-shadow: 0 10px 40px rgba(0,0,0,.2); }
+  .modal h2 { font-size: 18px; margin-bottom: 4px; }
+  .madrs-item { padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .madrs-item .row { display: flex; justify-content: space-between; font-weight: 600; }
+  .madrs-item input[type=range] { width: 100%; accent-color: var(--primary); }
+  .madrs-item .hints { display: flex; justify-content: space-between; color: var(--muted); font-size: 11.5px; }
+  .toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); background: var(--text); color: #fff; padding: 11px 20px;
+           border-radius: 10px; z-index: 60; box-shadow: 0 6px 20px rgba(0,0,0,.25); }
+
+  @media (max-width: 860px) {
+    .layout { flex-direction: column; } .sidebar { width: 100%; display: flex; gap: 6px; overflow-x: auto; padding: 10px 12px; border-right: none; border-bottom: 1px solid var(--border); }
+    .nav-item { width: auto; white-space: nowrap; margin: 0; } .content { padding: 18px 14px 40px; }
+    .two { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ============ LOGOWANIE ============ -->
+<div id="view-login" class="auth-wrap hidden">
+  <form class="auth-card" id="login-form" autocomplete="on">
+    <div class="brand"><span class="logo">✚</span> DEPRESS-SENSE</div>
+    <p class="lead">Panel specjalisty — zaloguj się kontem, którego używasz w aplikacji Specjalista.</p>
+    <label class="field">Login (ID specjalisty)<input id="login-id" type="text" autocomplete="username" required></label>
+    <label class="field">Hasło<input id="login-password" type="password" autocomplete="current-password" required></label>
+    <div class="form-error" id="login-error"></div>
+    <button class="btn block" type="submit">Zaloguj się</button>
+  </form>
+</div>
+
+<!-- ============ ZMIANA HASŁA ============ -->
+<div id="view-password" class="auth-wrap hidden">
+  <form class="auth-card" id="password-form">
+    <div class="brand"><span class="logo">✚</span> DEPRESS-SENSE</div>
+    <p class="lead">To Twoje pierwsze logowanie (albo administrator wymusił zmianę). Ustaw własne hasło — min. 8 znaków.</p>
+    <label class="field">Obecne hasło<input id="pw-old" type="password" autocomplete="current-password" required></label>
+    <label class="field">Nowe hasło<input id="pw-new" type="password" autocomplete="new-password" required></label>
+    <label class="field">Powtórz nowe hasło<input id="pw-new2" type="password" autocomplete="new-password" required></label>
+    <div class="form-error" id="pw-error"></div>
+    <button class="btn block" type="submit">Zapisz hasło</button>
+  </form>
+</div>
+
+<!-- ============ APLIKACJA ============ -->
+<div id="view-app" class="hidden">
+  <header class="topbar">
+    <div class="brand"><span class="logo">✚</span> DEPRESS-SENSE <span class="muted" style="font-weight:500">· panel specjalisty</span></div>
+    <div class="who"><span id="who"></span><button class="btn ghost small" id="logout-btn">Wyloguj</button></div>
+  </header>
+  <div class="layout">
+    <nav class="sidebar" id="nav">
+      <button class="nav-item" data-route="przeglad">Przegląd zbiorczy</button>
+      <button class="nav-item" data-route="pacjenci">Pacjenci</button>
+      <button class="nav-item" data-route="alerty">Alerty <span id="alert-badge"></span></button>
+    </nav>
+    <main class="content" id="content"></main>
+  </div>
+</div>
+
+<div id="modal-root"></div>
+<div id="toast" class="toast hidden"></div>
+
+<script src="/portal/static/chart.umd.js"></script>
+<script>
+"use strict";
+
+// ================= narzędzia =================
+const $ = (sel, root = document) => root.querySelector(sel);
+const esc = s => (s === null || s === undefined ? "" : String(s)).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmtDateTime = iso => iso ? new Date(iso).toLocaleString("pl-PL", {dateStyle: "short", timeStyle: "short"}) : "—";
+const fmtDate = iso => iso ? new Date(iso).toLocaleDateString("pl-PL") : "—";
+const shortDay = d => d.slice(8, 10) + "." + d.slice(5, 7);
+const num = (v, d = 1) => (v === null || v === undefined) ? "—" : Number(v).toFixed(d);
+
+function hoursText(h) {
+  if (h === null || h === undefined) return "brak danych";
+  if (h < 1) return "przed chwilą";
+  if (h < 48) return Math.round(h) + " godz. temu";
+  return Math.round(h / 24) + " dni temu";
+}
+function sevClass(sev) {
+  const s = (sev || "").toLowerCase();
+  if (s.includes("brak") || s.includes("minimal")) return "ok";
+  if (s.includes("umiarkowanie ci") || s.includes("ciężk") || s.includes("ciezk")) return "danger";
+  if (s.includes("umiarkowan")) return "warn";
+  if (s.includes("łagod") || s.includes("lagod")) return "info";
+  return "gray";
+}
+function toast(msg) {
+  const t = $("#toast"); t.textContent = msg; t.classList.remove("hidden");
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.add("hidden"), 3200);
+}
+
+async function api(path, method = "GET", body) {
+  const opts = { method, headers: { "X-Portal": "1" }, credentials: "same-origin" };
+  if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+  const resp = await fetch("/portal/api" + path, opts);
+  let data = null;
+  try { data = await resp.json(); } catch (e) {}
+  if (resp.status === 401 && !path.startsWith("/login")) { showLogin(); throw new Error("Sesja wygasła — zaloguj się ponownie."); }
+  if (!resp.ok) {
+    const d = data && data.detail;
+    throw new Error(typeof d === "string" ? d : "Błąd (kod " + resp.status + ")");
+  }
+  return data;
+}
+
+// ================= wykresy =================
+Chart.defaults.font.family = "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif";
+Chart.defaults.color = "#5f7780";
+Chart.defaults.borderColor = "#e8eff2";
+const COLORS = ["#0e7c86", "#3b6fb6", "#c9861a", "#7b5ea7", "#d64545", "#2e9e6b", "#8a8f98"];
+const charts = {};
+function destroyCharts() { for (const k of Object.keys(charts)) { charts[k].destroy(); delete charts[k]; } }
+function drawChart(id, config) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return;
+  if (charts[id]) charts[id].destroy();
+  config.options = Object.assign({
+    responsive: true, maintainAspectRatio: false,
+    interaction: { mode: "index", intersect: false },
+    plugins: { legend: { position: "bottom", labels: { boxWidth: 12, usePointStyle: true } } },
+  }, config.options || {});
+  charts[id] = new Chart(canvas, config);
+}
+function line(label, data, color, extra = {}) {
+  return Object.assign({ label, data, borderColor: color, backgroundColor: color + "22", borderWidth: 2, tension: 0.25,
+                         pointRadius: 2, pointHoverRadius: 4, spanGaps: false }, extra);
+}
+function refLine(label, value, len, color = "#9aa9b0") {
+  return { label, data: Array(len).fill(value), borderColor: color, borderDash: [6, 5], borderWidth: 1.5, pointRadius: 0, fill: false };
+}
+function mean(arr) {
+  const k = arr.filter(v => v !== null && v !== undefined);
+  return k.length ? k.reduce((a, b) => a + b, 0) / k.length : null;
+}
+function sparse(days, entries, valueFn) {   // wpisy rzadkie (PHQ-9/MADRS) → tablica na osi dni
+  const out = Array(days.length).fill(null);
+  for (const e of entries) { const i = days.indexOf(e.date); if (i >= 0) out[i] = valueFn(e); }
+  return out;
+}
+const yPct = { min: 0, max: 100, title: { display: true, text: "%" } };
+
+// ================= stan i routing =================
+let me = null;
+let overviewCache = null;
+
+function showView(name) {
+  for (const v of ["login", "password", "app"]) $("#view-" + v).classList.toggle("hidden", v !== name);
+}
+function showLogin() { destroyCharts(); me = null; showView("login"); $("#login-password").value = ""; }
+
+function route() {
+  const hash = location.hash.replace(/^#\/?/, "");
+  const [name, arg] = hash.split("/");
+  document.querySelectorAll(".nav-item").forEach(b =>
+    b.classList.toggle("active", b.dataset.route === (name === "pacjent" ? "pacjenci" : (name || "przeglad"))));
+  destroyCharts();
+  const content = $("#content");
+  content.innerHTML = '<div class="empty">Ładowanie…</div>';
+  const run = name === "pacjenci" ? renderPatients
+    : name === "alerty" ? renderAlerts
+    : name === "pacjent" && arg ? () => renderPatient(decodeURIComponent(arg))
+    : renderOverview;
+  Promise.resolve(run()).catch(err => { content.innerHTML = '<div class="card empty">' + esc(err.message) + "</div>"; });
+}
+window.addEventListener("hashchange", () => { if (me && !me.must_change_password) route(); });
+$("#nav").addEventListener("click", e => { const b = e.target.closest("[data-route]"); if (b) location.hash = "#/" + b.dataset.route; });
+
+async function loadOverview() {
+  overviewCache = await api("/overview");
+  const s = overviewCache.summary;
+  const n = s.safety_alerts + s.change_alerts + s.disappeared;
+  $("#alert-badge").innerHTML = n ? '<span class="nav-badge' + (s.safety_alerts ? "" : " soft") + '">' + n + "</span>" : "";
+  return overviewCache;
+}
+
+// ================= logowanie =================
+$("#login-form").addEventListener("submit", async e => {
+  e.preventDefault(); $("#login-error").textContent = "";
+  try {
+    me = await api("/login", "POST", { specialist_id: $("#login-id").value, password: $("#login-password").value });
+    afterAuth();
+  } catch (err) { $("#login-error").textContent = err.message; }
+});
+$("#password-form").addEventListener("submit", async e => {
+  e.preventDefault(); const err = $("#pw-error"); err.textContent = "";
+  if ($("#pw-new").value !== $("#pw-new2").value) { err.textContent = "Nowe hasła nie są takie same."; return; }
+  try {
+    await api("/change-password", "POST", { old_password: $("#pw-old").value, new_password: $("#pw-new").value });
+    me.must_change_password = false; afterAuth();
+  } catch (ex) { err.textContent = ex.message; }
+});
+$("#logout-btn").addEventListener("click", async () => { try { await api("/logout", "POST", {}); } catch (e) {} showLogin(); });
+
+function afterAuth() {
+  if (me.must_change_password) { showView("password"); return; }
+  $("#who").textContent = "Zalogowano: " + me.specialist_id;
+  showView("app");
+  if (!location.hash) location.hash = "#/przeglad"; else route();
+}
+
+// ================= PRZEGLĄD ZBIORCZY =================
+let groupDays = 30;
+async function renderOverview() {
+  const [ov, gt] = await Promise.all([loadOverview(), api("/group-trends?days=" + groupDays)]);
+  const s = ov.summary;
+  const kpi = (lbl, val, cls = "") => `<div class="card kpi ${cls}"><div class="lbl">${lbl}</div><div class="num">${val}</div></div>`;
+  const attention = ov.patients.filter(p => p.safety_alert || p.change_flagged || p.disappeared);
+  $("#content").innerHTML = `
+    <div class="page-head"><div><h1>Przegląd zbiorczy</h1>
+      <div class="sub">Wszyscy Twoi pacjenci razem — stan na ${fmtDateTime(new Date().toISOString())}</div></div>
+      <div class="tabs" id="group-days">${[14, 30, 90].map(d => `<button data-d="${d}" class="${d === groupDays ? "active" : ""}">${d} dni</button>`).join("")}</div></div>
+    <div class="grid kpis">
+      ${kpi("Pacjenci", s.total)}
+      ${kpi("Alerty bezpieczeństwa", s.safety_alerts, s.safety_alerts ? "alert-danger" : "")}
+      ${kpi("Zmiana zachowania", s.change_alerts, s.change_alerts ? "alert-warn" : "")}
+      ${kpi("Brak kontaktu >48 h", s.disappeared, s.disappeared ? "alert-warn" : "")}
+      ${kpi("Śr. PHQ-9", s.avg_phq9 === null ? "—" : s.avg_phq9 + '<small class="muted"> /27</small>')}
+      ${kpi("Samoocena regularna", s.self_assessment_regular_pct === null ? "—" : s.self_assessment_regular_pct + "%")}
+    </div>
+    <div class="card" style="margin-bottom:16px">
+      <h2>Wymaga uwagi</h2><div class="hint">Pacjenci z nieocenionym alertem PHQ-9, wykrytą trwałą zmianą zachowania lub brakiem kontaktu.</div>
+      ${attention.length ? attention.map(p => `<div class="kv" style="padding:9px 0;border-top:1px solid var(--border)">
+          <span><b>${esc(p.name || p.id.slice(0, 8))}</b> ${chipsFor(p)}</span>
+          <button class="btn secondary small" data-open="${esc(p.id)}">Otwórz</button></div>`).join("")
+        : '<div class="muted">Brak pacjentów wymagających uwagi.</div>'}
+    </div>
+    ${gt.days.length ? `
+    <div class="section-title"><h2>Wykresy zbiorcze — średnie po wszystkich pacjentach</h2></div>
+    <div class="grid two">
+      <div class="card"><h2>Aktywność (średnia)</h2><div class="hint">Ruch, mobilność GPS i aktywność w pomieszczeniu, 0–100%.</div><div class="chart-box"><canvas id="g-activity"></canvas></div></div>
+      <div class="card"><h2>Samoocena (średnia)</h2><div class="hint">Skala 0–10, wyżej = lepiej.</div><div class="chart-box"><canvas id="g-mood"></canvas></div></div>
+      <div class="card"><h2>Telefon: czas ekranu i komunikacja</h2><div class="hint">Minuty ekranu (lewa oś) oraz liczba połączeń i SMS (prawa oś).</div><div class="chart-box"><canvas id="g-phone"></canvas></div></div>
+      <div class="card"><h2>PHQ-9 — każdy pacjent osobno</h2><div class="hint">Wyniki 0–27 w czasie; każda linia to jeden pacjent.</div><div class="chart-box"><canvas id="g-phq"></canvas></div></div>
+      <div class="card"><h2>Rozkład nasilenia PHQ-9</h2><div class="hint">Ostatni wynik każdego pacjenta.</div><div class="chart-box"><canvas id="g-sev"></canvas></div></div>
+      <div class="card"><h2>Regularność samooceny</h2><div class="hint">Liczba dni z wpisem w ostatnich 7 dniach.</div><div class="chart-box"><canvas id="g-reg"></canvas></div></div>
+    </div>
+    <div class="card" style="margin-top:16px"><h2>Ilu pacjentów przesłało dane</h2><div class="hint">Liczba pacjentów z pomiarami danego dnia (z ${gt.patients} aktywnych).</div><div class="chart-box" style="height:200px"><canvas id="g-reporting"></canvas></div></div>
+    ` : '<div class="card empty">Brak aktywnych pacjentów — dodaj pierwszego w zakładce „Pacjenci”.</div>'}
+    <p class="disclaimer">Panel służy do monitorowania, nie stawia diagnozy. Interpretacja wyników i decyzje kliniczne należą do specjalisty.</p>`;
+  $("#group-days").onclick = e => { const b = e.target.closest("[data-d]"); if (b) { groupDays = +b.dataset.d; route(); } };
+  $("#content").onclick = e => { const b = e.target.closest("[data-open]"); if (b) location.hash = "#/pacjent/" + encodeURIComponent(b.dataset.open); };
+  if (!gt.days.length) return;
+
+  const labels = gt.days.map(shortDay), S = gt.series;
+  drawChart("g-activity", { type: "line", data: { labels, datasets: [
+    line("Aktywność ruchowa", S.movement_avg, COLORS[0]), line("Mobilność (GPS)", S.mobility_avg, COLORS[1]),
+    line("Aktywność w pomieszczeniu", S.room_activity_avg, COLORS[2])] }, options: { scales: { y: yPct } } });
+  drawChart("g-mood", { type: "line", data: { labels, datasets: [
+    line("Nastrój", S.self_assessment_mood, COLORS[0]), line("Energia", S.self_assessment_energy, COLORS[2]),
+    line("Sen", S.self_assessment_sleep_quality, COLORS[1]), line("Przyjemność (anhedonia)", S.self_assessment_anhedonia, COLORS[3])] },
+    options: { scales: { y: { min: 0, max: 10 } } } });
+  drawChart("g-phone", { data: { labels, datasets: [
+    line("Czas ekranu (min)", S.screen_time_minutes_avg, COLORS[0], { type: "line", yAxisID: "y" }),
+    { type: "bar", label: "Połączenia + SMS", data: S.communication_count, backgroundColor: COLORS[2] + "88", yAxisID: "y1" }] },
+    options: { scales: { y: { beginAtZero: true, title: { display: true, text: "min" } },
+                         y1: { position: "right", beginAtZero: true, grid: { drawOnChartArea: false } } } } });
+  const phqNames = Object.keys(gt.phq9_by_patient);
+  drawChart("g-phq", { type: "line", data: { labels, datasets: phqNames.map((n, i) =>
+    line(n, sparse(gt.days, gt.phq9_by_patient[n], e => e.total_score), COLORS[i % COLORS.length], { spanGaps: true, pointRadius: 4 })) },
+    options: { scales: { y: { min: 0, max: 27 } } } });
+  const sevKeys = Object.keys(s.phq9_severity);
+  drawChart("g-sev", { type: "doughnut", data: { labels: sevKeys, datasets: [{ data: sevKeys.map(k => s.phq9_severity[k]),
+    backgroundColor: sevKeys.map(k => ({ ok: "#2e9e6b", info: "#3b6fb6", warn: "#c9861a", danger: "#d64545", gray: "#b8c4ca" })[sevClass(k)]) }] },
+    options: { interaction: { mode: "nearest" }, cutout: "58%" } });
+  drawChart("g-reg", { type: "bar", data: { labels: ov.patients.map(p => p.name || p.id.slice(0, 8)),
+    datasets: [{ label: "Dni z samooceną (7 dni)", data: ov.patients.map(p => p.self_assessment_count_7d), backgroundColor: COLORS[0] }] },
+    options: { scales: { y: { min: 0, max: 7, ticks: { stepSize: 1 } } }, plugins: { legend: { display: false } } } });
+  drawChart("g-reporting", { type: "bar", data: { labels, datasets: [{ label: "Pacjenci z danymi", data: gt.reporting, backgroundColor: COLORS[1] }] },
+    options: { scales: { y: { beginAtZero: true, ticks: { stepSize: 1 }, suggestedMax: gt.patients } }, plugins: { legend: { display: false } } } });
+}
+
+function chipsFor(p) {
+  let h = "";
+  if (p.safety_alert) h += '<span class="chip danger">Alert bezpieczeństwa</span> ';
+  if (p.change_flagged) h += '<span class="chip warn">Zmiana zachowania</span> ';
+  if (p.disappeared) h += '<span class="chip warn">Brak kontaktu</span> ';
+  if (p.flag) h += '<span class="chip info">Wymaga uwagi</span> ';
+  return h;
+}
+
+// ================= PACJENCI =================
+async function renderPatients() {
+  const ov = await loadOverview();
+  $("#content").innerHTML = `
+    <div class="page-head"><div><h1>Pacjenci</h1><div class="sub">${ov.patients.length} przypisanych do Ciebie</div></div></div>
+    <div class="card" style="margin-bottom:16px">
+      <h3>Dodaj pacjenta</h3><div class="hint">Wklej ID z ekranu głównego aplikacji Pacjent (pacjent musi wcześniej uruchomić apkę). Dodanie aktywuje jego konto.</div>
+      <div class="toolbar" style="margin:0"><input class="input" id="add-id" placeholder="ID pacjenta" style="min-width:320px"><button class="btn" id="add-btn">Dodaj pacjenta</button></div>
+      <div class="form-error" id="add-err"></div></div>
+    <div class="toolbar"><input class="input" id="p-search" type="search" placeholder="Szukaj po nazwie lub ID…"></div>
+    <div class="card table-card" id="p-table"></div>`;
+  const draw = () => {
+    const q = $("#p-search").value.trim().toLowerCase();
+    const rows = ov.patients.filter(p => !q || (p.name || "").toLowerCase().includes(q) || p.id.toLowerCase().includes(q));
+    $("#p-table").innerHTML = rows.length ? `<table><thead><tr><th>Pacjent</th><th>Alerty</th><th>PHQ-9</th><th>MADRS</th><th>Samoocena 7 dni</th><th>Ostatnia synchronizacja</th></tr></thead><tbody>` +
+      rows.map(p => `<tr class="clickable" data-open="${esc(p.id)}">
+        <td><b>${esc(p.name || "pacjent " + p.id.slice(0, 8))}</b><div class="mono muted">${esc(p.id.slice(0, 13))}…</div></td>
+        <td>${chipsFor(p) || '<span class="chip ok">w normie</span>'}</td>
+        <td>${p.last_phq9 ? `${p.last_phq9.total_score}/27 <span class="chip ${sevClass(p.last_phq9.severity)}">${esc(p.last_phq9.severity)}</span>` : '<span class="muted">—</span>'}${p.phq9_due ? ' <span class="chip gray">do wypełnienia</span>' : ""}</td>
+        <td>${p.last_madrs ? `${p.last_madrs.total_score}/60` : '<span class="muted">—</span>'}</td>
+        <td>${p.self_assessment_count_7d}/7 dni</td>
+        <td>${fmtDateTime(p.last_sync)}</td></tr>`).join("") + "</tbody></table>"
+      : '<div class="empty">Brak pacjentów. Dodaj pierwszego powyżej.</div>';
+  };
+  draw();
+  $("#p-search").oninput = draw;
+  $("#p-table").onclick = e => { const r = e.target.closest("[data-open]"); if (r) location.hash = "#/pacjent/" + encodeURIComponent(r.dataset.open); };
+  $("#add-btn").onclick = async () => {
+    $("#add-err").textContent = "";
+    try { await api("/patients", "POST", { patient_id: $("#add-id").value }); toast("Pacjent dodany i aktywowany."); route(); }
+    catch (err) { $("#add-err").textContent = err.message; }
+  };
+}
+
+// ================= ALERTY =================
+async function renderAlerts() {
+  const ov = await loadOverview();
+  const safety = ov.patients.filter(p => p.safety_alert);
+  const changes = ov.patients.filter(p => p.change_flagged || p.disappeared);
+  const row = (p, text) => `<div class="kv" style="padding:12px 0;border-top:1px solid var(--border);align-items:center">
+      <span><b>${esc(p.name || p.id.slice(0, 8))}</b><div class="muted">${text}</div></span>
+      <button class="btn secondary small" data-open="${esc(p.id)}">Otwórz pacjenta</button></div>`;
+  $("#content").innerHTML = `
+    <div class="page-head"><div><h1>Alerty</h1><div class="sub">Co wymaga Twojej oceny</div></div></div>
+    <div class="card" style="margin-bottom:16px"><h2>Alerty bezpieczeństwa (PHQ-9, pytanie 9)</h2>
+      <div class="hint">Wynik wymaga oceny klinicznej. Aplikacja nie interpretuje stopnia ryzyka — to Twoja decyzja.</div>
+      ${safety.length ? safety.map(p => row(p, "Zgłoszono " + fmtDateTime(p.safety_alert.since))).join("") : '<div class="muted">Brak nieocenionych alertów.</div>'}</div>
+    <div class="card"><h2>Zmiana zachowania i brak kontaktu</h2>
+      <div class="hint">Model porównuje każdego pacjenta wyłącznie z jego własną historią. To monitoring danych, nie ocena kliniczna.</div>
+      ${changes.length ? changes.map(p => row(p, [p.change_flagged ? "trwała zmiana od " + fmtDate(p.change_since) : "", p.disappeared ? "ostatnia synchronizacja: " + hoursText(p.hours_since_last_sync) : ""].filter(Boolean).join(" · "))).join("") : '<div class="muted">Brak wykrytych zmian.</div>'}</div>`;
+  $("#content").onclick = e => { const b = e.target.closest("[data-open]"); if (b) location.hash = "#/pacjent/" + encodeURIComponent(b.dataset.open); };
+}
+
+// ================= SZCZEGÓŁY PACJENTA =================
+let patientDays = 30;
+const TILES = [
+  ["Aktywność telefonu", "phone_activity", "%"], ["Czas korzystania z telefonu", "screen_time_minutes", " min"],
+  ["Blokowanie/odblokowanie telefonu", "unlocks", ""], ["Używanie aplikacji", "app_usage", "%"],
+  ["Aktywność ruchowa", "movement", "%"], ["Mobilność (GPS)", "mobility", "%"],
+  ["Aktywność w pomieszczeniu", "room_activity", "%"], ["Połączenia telefoniczne", "calls", ""], ["SMS", "sms", ""],
+  ["Czas: aplikacje społeczne", "category_social_minutes", " min"], ["Czas: produktywność", "category_productivity_minutes", " min"],
+  ["Czas: inne aplikacje", "category_other_minutes", " min"], ["Łączny czas rozmów", "call_duration_minutes", " min"],
+];
+function tile(label, avg, pct, suffix) {
+  const trend = pct === null || pct === undefined ? "brak porównania"
+    : pct > 0.5 ? "▲ +" + num(pct) + "%" : pct < -0.5 ? "▼ " + num(pct) + "%" : "— bez zmian";
+  return `<div class="tile"><div class="t-lbl">${esc(label)}</div>
+    <div class="t-val">${avg === null || avg === undefined ? '<small>brak danych</small>' : num(avg) + "<small>" + esc(suffix) + "</small>"}</div>
+    <div class="t-trend">${trend}</div></div>`;
+}
+
+async function renderPatient(id) {
+  const [det, tr] = await Promise.all([api("/patients/" + encodeURIComponent(id)), api("/patients/" + encodeURIComponent(id) + "/trends?days=" + patientDays)]);
+  const d = det.data, ch = det.change, sa = d.self_assessment, ph = d.last_phq9, md = d.last_madrs;
+  const name = d.name || "Pacjent " + id.slice(0, 8);
+  const saBar = (lbl, v) => `<div class="kv"><span>${lbl}</span><b>${v}/10</b></div><div class="bar"><span style="width:${v * 10}%"></span></div>`;
+  const cdText = !ch ? "brak danych" : ch.insufficient_data ? `Zbiera się wzorzec (${ch.baseline_days_used} z min. 5 dni danych)`
+    : ch.flagged ? "Wykryta trwała zmiana od " + fmtDate(ch.flagged_since) : "Brak wykrytych zmian";
+  const cdClass = !ch || ch.insufficient_data ? "gray" : ch.flagged ? "warn" : "ok";
+  $("#content").innerHTML = `
+    <button class="back" id="back">← Wszyscy pacjenci</button>
+    <div class="page-head"><div><h1>${esc(name)}</h1>
+      <div class="sub mono">ID: ${esc(id)} · ostatnia synchronizacja: ${fmtDateTime(d.last_sync)}</div></div>
+      <div class="actions">
+        <button class="btn" id="a-contact">Zainicjuj kontakt</button>
+        <button class="btn secondary" id="a-madrs">Wprowadź ocenę MADRS</button>
+        <button class="btn ghost" id="a-edit">Informacje / edycja</button>
+      </div></div>
+    ${det.safety_alert ? `<div class="banner danger"><div><b>Alert bezpieczeństwa — wymaga oceny klinicznej</b>
+        Pacjent zaznaczył w PHQ-9 odpowiedź na pytanie 9. (${fmtDateTime(det.safety_alert.since)}). Aplikacja nie interpretuje ryzyka.</div>
+        <button class="btn danger small" id="a-review" data-entry="${det.safety_alert.entry_id}">Oznacz jako ocenione</button></div>` : ""}
+    ${det.flag ? `<div class="banner warn"><div><b>Pacjent oznaczony do uwagi</b>Po podjęciu działań zdejmij oznaczenie — data zostanie zapisana.</div>
+        <button class="btn secondary small" id="a-clear">Podjęto działania</button></div>` : ""}
+    ${ch && ch.disappeared ? `<div class="banner warn"><div><b>Brak kontaktu z pacjentem</b>Ostatnia synchronizacja: ${hoursText(ch.hours_since_last_sync)}.</div></div>` : ""}
+
+    <div class="section-title"><h2>Ostatnie 24 godziny</h2><span class="muted">średnie i zmiana względem poprzedniego pomiaru${d.stats_computed_at ? " · liczone " + fmtDateTime(d.stats_computed_at) : ""}</span></div>
+    <div class="grid tiles">${TILES.map(([l, k, s]) => tile(l, d[k + "_avg"], d[k + "_pct"], s)).join("")}</div>
+
+    <div class="section-title"><h2>Kwestionariusze i ocena</h2></div>
+    <div class="grid three">
+      <div class="card"><h2>Samoocena</h2><div class="hint">${sa ? "Ostatni wpis: " + fmtDateTime(sa.timestamp) : "Brak wpisów"} · wypełniono ${d.self_assessment_count_7d}/7 dni</div>
+        ${sa ? saBar("Nastrój", sa.mood) + saBar("Energia", sa.energy) + saBar("Jakość snu", sa.sleep_quality) + saBar("Przyjemność (anhedonia)", sa.anhedonia) : '<div class="muted">brak danych</div>'}</div>
+      <div class="card"><h2>PHQ-9</h2><div class="hint">${ph ? "Ostatni wynik: " + fmtDateTime(ph.timestamp) : "Brak wyniku"}${d.phq9_due ? " · czas na nowy" : ""}</div>
+        ${ph ? `<div class="big">${ph.total_score}<small> /27</small></div><span class="chip ${sevClass(ph.severity)}">${esc(ph.severity)}</span>
+          ${ph.safety_flag ? ` <span class="chip ${ph.safety_reviewed ? "ok" : "danger"}">${ph.safety_reviewed ? "flaga oceniona" : "wymaga oceny klinicznej"}</span>` : ""}` : '<div class="muted">brak danych</div>'}</div>
+      <div class="card"><h2>MADRS</h2><div class="hint">${md ? (md.occasion ? esc(md.occasion) + " · " : "") + fmtDateTime(md.timestamp) : "Brak oceny"}</div>
+        ${md ? `<div class="big">${md.total_score}<small> /60</small></div><span class="chip ${sevClass(md.severity)}">${esc(md.severity)}</span>` : '<div class="muted">brak danych — wprowadź ocenę przyciskiem u góry</div>'}</div>
+      <div class="card"><h2>Model wykrywania zmian</h2><div class="hint">Porównanie wyłącznie z własną historią pacjenta.</div>
+        <span class="chip ${cdClass}">${esc(cdText)}</span>
+        <div class="kv" style="margin-top:12px"><span class="muted">Rytm dobowy</span><span>${d.circadian_computed_at ? (d.circadian_shifted ? "przesunięty" : "bez przesunięcia") + " (" + num(d.circadian_deviation_pct, 0) + "% odchylenia)" : "brak danych"}</span></div>
+        <div class="kv"><span class="muted">Opiekunowie</span><span>${det.caregivers.current}/${det.caregivers.slots}</span></div>
+        <div class="kv"><span class="muted">Ostatnia podjęta akcja</span><span>${d.last_action_at ? fmtDateTime(d.last_action_at) : "—"}</span></div></div>
+      <div class="card" style="grid-column: span 2"><h2>Historia PHQ-9 i MADRS</h2><div class="hint">Ostatnie wpisy.</div>
+        <table class="mini-table"><thead><tr><th>Data</th><th>Skala</th><th>Wynik</th><th>Nasilenie</th><th>Uwagi</th></tr></thead><tbody>
+        ${[...det.phq9_history.map(e => ({ t: e.timestamp, k: "PHQ-9", s: e.total_score + "/27", v: e.severity, n: e.safety_flag ? (e.safety_reviewed ? "flaga oceniona" : "wymaga oceny") : "" })),
+           ...det.madrs_history.map(e => ({ t: e.timestamp, k: "MADRS", s: e.total_score + "/60", v: e.severity, n: [e.occasion, e.safety_flag ? "myśli samobójcze > 0" : ""].filter(Boolean).join(" · ") }))]
+          .sort((a, b) => b.t.localeCompare(a.t)).slice(0, 10)
+          .map(r => `<tr><td>${fmtDate(r.t)}</td><td>${r.k}</td><td>${r.s}</td><td><span class="chip ${sevClass(r.v)}">${esc(r.v)}</span></td><td class="muted">${esc(r.n)}</td></tr>`).join("") ||
+          '<tr><td colspan="5" class="muted">brak wpisów</td></tr>'}
+        </tbody></table></div>
+    </div>
+
+    <div class="section-title"><h2>Wykresy pacjenta</h2>
+      <div class="tabs" id="p-days">${[14, 30, 90].map(x => `<button data-d="${x}" class="${x === patientDays ? "active" : ""}">${x} dni</button>`).join("")}</div></div>
+    <div class="card" style="margin-bottom:16px"><h2>Dane cyfrowe a kwestionariusze (nałożone)</h2>
+      <div class="hint">Ruch, mobilność i nastrój w skali 0–100%; wyniki PHQ-9 i MADRS jako punkty (% skali). Przerwa w linii = brak danych, nie zero.</div>
+      <div class="chart-box tall"><canvas id="c-overlay"></canvas></div></div>
+    <div class="grid two">
+      <div class="card"><h2>Aktywność</h2><div class="hint">Ruch (żyroskop), mobilność (GPS), aktywność w pomieszczeniu — 0–100%.</div><div class="chart-box"><canvas id="c-activity"></canvas></div></div>
+      <div class="card"><h2>Czas korzystania z telefonu</h2><div class="hint">Minuty ekranu; przerywana linia = średnia pacjenta z tego okna.</div><div class="chart-box"><canvas id="c-screen"></canvas></div></div>
+      <div class="card"><h2>Komunikacja</h2><div class="hint">Połączenia + SMS dziennie; przerywana linia = średnia.</div><div class="chart-box"><canvas id="c-comm"></canvas></div></div>
+      <div class="card"><h2>Samoocena</h2><div class="hint">Skala 0–10, wyżej = lepiej.</div><div class="chart-box"><canvas id="c-self"></canvas></div></div>
+      <div class="card"><h2>PHQ-9 i MADRS w czasie</h2><div class="hint">PHQ-9 (0–27, lewa oś), MADRS (0–60, prawa oś).</div><div class="chart-box"><canvas id="c-quest"></canvas></div></div>
+      <div class="card"><h2>Wynik modelu wykrywania zmian</h2><div class="hint">Odchylenie od własnego wzorca; przerywana linia = próg alertu (${ch ? ch.threshold : "—"}).</div><div class="chart-box"><canvas id="c-change"></canvas></div></div>
+    </div>
+    <p class="disclaimer">Dane mają charakter pomocniczy i nie stanowią diagnozy. Zbierane są wyłącznie metadane — bez treści wiadomości, nagrań i dokładnych tras GPS.</p>`;
+
+  const c = $("#content");
+  $("#back").onclick = () => { location.hash = "#/pacjenci"; };
+  $("#p-days").onclick = e => { const b = e.target.closest("[data-d]"); if (b) { patientDays = +b.dataset.d; route(); } };
+  $("#a-contact").onclick = async () => {
+    if (!confirm("Czy na pewno chcesz zainicjować kontakt z tym pacjentem? Pacjent dostanie powiadomienie.")) return;
+    try { await api("/patients/" + encodeURIComponent(id) + "/contact", "POST", {}); toast("Wysłano prośbę o kontakt."); } catch (e) { toast(e.message); }
+  };
+  $("#a-madrs").onclick = () => openMadrs(id, name);
+  $("#a-edit").onclick = () => openEdit(id, d.name, det.caregivers.slots);
+  if ($("#a-review")) $("#a-review").onclick = async e => {
+    if (!confirm("Potwierdzasz, że dokonano oceny klinicznej po tym wyniku?")) return;
+    try { await api("/patients/" + encodeURIComponent(id) + "/phq9/" + e.target.dataset.entry + "/review", "POST", {}); toast("Oznaczono jako ocenione."); route(); } catch (x) { toast(x.message); }
+  };
+  if ($("#a-clear")) $("#a-clear").onclick = async () => {
+    if (!confirm("Czy wobec tego pacjenta podjęto już wymagane działania?")) return;
+    try { await api("/patients/" + encodeURIComponent(id) + "/clear-flag", "POST", {}); toast("Zapisano."); route(); } catch (x) { toast(x.message); }
+  };
+
+  // --- wykresy ---
+  const labels = tr.days.map(shortDay), n = labels.length;
+  const mood10 = tr.self_assessment_mood.map(v => v === null ? null : v * 10);
+  drawChart("c-overlay", { type: "line", data: { labels, datasets: [
+    line("Ruch", tr.movement_avg, COLORS[0]), line("Mobilność GPS", tr.mobility_avg, COLORS[1]), line("Nastrój (×10)", mood10, COLORS[2]),
+    line("PHQ-9 (% skali)", sparse(tr.days, tr.phq9, e => e.total_score / 27 * 100), COLORS[4], { showLine: false, pointRadius: 6, pointStyle: "rectRot" }),
+    line("MADRS (% skali)", sparse(tr.days, tr.madrs, e => e.total_score / 60 * 100), COLORS[3], { showLine: false, pointRadius: 6, pointStyle: "triangle" })] },
+    options: { scales: { y: yPct } } });
+  drawChart("c-activity", { type: "line", data: { labels, datasets: [
+    line("Ruch", tr.movement_avg, COLORS[0]), line("Mobilność GPS", tr.mobility_avg, COLORS[1]), line("W pomieszczeniu", tr.room_activity_avg, COLORS[2])] },
+    options: { scales: { y: yPct } } });
+  drawChart("c-screen", { type: "line", data: { labels, datasets: [
+    line("Czas ekranu (min)", tr.screen_time_minutes_avg, COLORS[0]), refLine("Średnia pacjenta", mean(tr.screen_time_minutes_avg), n)] },
+    options: { scales: { y: { beginAtZero: true } } } });
+  drawChart("c-comm", { data: { labels, datasets: [
+    { type: "bar", label: "Połączenia + SMS", data: tr.communication_count, backgroundColor: COLORS[2] + "99" },
+    Object.assign(refLine("Średnia pacjenta", mean(tr.communication_count), n), { type: "line" })] },
+    options: { scales: { y: { beginAtZero: true } } } });
+  drawChart("c-self", { type: "line", data: { labels, datasets: [
+    line("Nastrój", tr.self_assessment_mood, COLORS[0]), line("Energia", tr.self_assessment_energy, COLORS[2]),
+    line("Sen", tr.self_assessment_sleep_quality, COLORS[1]), line("Przyjemność", tr.self_assessment_anhedonia, COLORS[3])] },
+    options: { scales: { y: { min: 0, max: 10 } } } });
+  drawChart("c-quest", { type: "line", data: { labels, datasets: [
+    line("PHQ-9", sparse(tr.days, tr.phq9, e => e.total_score), COLORS[4], { spanGaps: true, pointRadius: 5, yAxisID: "y" }),
+    line("MADRS", sparse(tr.days, tr.madrs, e => e.total_score), COLORS[3], { spanGaps: true, pointRadius: 5, yAxisID: "y1" })] },
+    options: { scales: { y: { min: 0, max: 27, title: { display: true, text: "PHQ-9" } },
+                         y1: { min: 0, max: 60, position: "right", grid: { drawOnChartArea: false }, title: { display: true, text: "MADRS" } } } } });
+  if (ch && ch.days) {
+    const cdDays = ch.days.slice(-Math.min(ch.days.length, patientDays));
+    drawChart("c-change", { type: "line", data: { labels: cdDays.map(x => shortDay(x.date)), datasets: [
+      line("Wynik odchylenia", cdDays.map(x => x.score), COLORS[0]), refLine("Próg alertu", ch.threshold, cdDays.length, COLORS[4])] },
+      options: { scales: { y: { beginAtZero: true } } } });
+  }
+}
+
+// ================= MODALE =================
+const MADRS_ITEMS = [
+  ["1. Widoczny smutek", "brak", "głęboki smutek, rozpacz"], ["2. Zgłaszany smutek", "sporadyczny", "stały, niezmienny"],
+  ["3. Napięcie wewnętrzne", "spokój", "paniczny strach"], ["4. Skrócony sen", "normalny", "sen skrócony o 2–3 h lub mniej"],
+  ["5. Obniżony apetyt", "normalny", "brak apetytu"], ["6. Trudności z koncentracją", "brak", "niezdolność do czytania/rozmowy"],
+  ["7. Apatia / brak inicjatywy", "brak", "całkowita apatia"], ["8. Niezdolność odczuwania", "normalna reaktywność", "całkowita anestezja emocjonalna"],
+  ["9. Myśli pesymistyczne", "brak", "urojenia winy/ruiny/kary"], ["10. Myśli samobójcze", "cieszy się życiem", "czynne myśli/plany samobójcze"],
+];
+function openModal(html) {
+  $("#modal-root").innerHTML = `<div class="backdrop" id="backdrop"><div class="modal">${html}</div></div>`;
+  $("#backdrop").addEventListener("mousedown", e => { if (e.target.id === "backdrop") closeModal(); });
+}
+function closeModal() { $("#modal-root").innerHTML = ""; }
+
+function openMadrs(patientId, name) {
+  openModal(`<h2>MADRS — ocena kliniczna</h2><div class="muted">Pacjent: ${esc(name)}. Wypełnia specjalista podczas wizyty.</div>
+    <label class="field" style="margin-top:14px">Punkt pomiaru (np. T0, Tydzień 4)<input id="m-occasion" type="text"></label>
+    ${MADRS_ITEMS.map((it, i) => `<div class="madrs-item"><div class="row"><span>${esc(it[0])}</span><span id="mv-${i}">0</span></div>
+      <input type="range" min="0" max="6" step="1" value="0" data-i="${i}"><div class="hints"><span>0 — ${esc(it[1])}</span><span>6 — ${esc(it[2])}</span></div></div>`).join("")}
+    <div class="form-error" id="m-err"></div>
+    <div class="actions" style="justify-content:flex-end"><button class="btn ghost" id="m-cancel">Anuluj</button><button class="btn" id="m-save">Zapisz ocenę</button></div>`);
+  $("#modal-root").oninput = e => { const r = e.target.closest("input[type=range]"); if (r) $("#mv-" + r.dataset.i).textContent = r.value; };
+  $("#m-cancel").onclick = closeModal;
+  $("#m-save").onclick = async () => {
+    const body = { occasion: $("#m-occasion").value.trim() || null };
+    document.querySelectorAll("#modal-root input[type=range]").forEach(r => { body["item" + (+r.dataset.i + 1)] = +r.value; });
+    try { await api("/patients/" + encodeURIComponent(patientId) + "/madrs", "POST", body); closeModal(); toast("Zapisano ocenę MADRS."); route(); }
+    catch (e) { $("#m-err").textContent = e.message; }
+  };
+}
+
+function openEdit(patientId, name, slots) {
+  openModal(`<h2>Informacje o pacjencie</h2><div class="muted mono">ID: ${esc(patientId)}</div>
+    <label class="field" style="margin-top:14px">Nazwa pacjenta<input id="e-name" type="text" value="${esc(name || "")}" maxlength="120"></label>
+    <label class="field">Liczba dozwolonych opiekunów<input id="e-slots" type="number" min="0" max="10" value="${esc(slots)}"></label>
+    <div class="form-error" id="e-err"></div>
+    <div class="actions" style="justify-content:flex-end"><button class="btn ghost" id="e-cancel">Anuluj</button><button class="btn" id="e-save">Zapisz</button></div>`);
+  $("#e-cancel").onclick = closeModal;
+  $("#e-save").onclick = async () => {
+    try {
+      await api("/patients/" + encodeURIComponent(patientId), "PATCH", { name: $("#e-name").value, caregiver_slots: parseInt($("#e-slots").value, 10) || 0 });
+      closeModal(); toast("Zapisano."); route();
+    } catch (e) { $("#e-err").textContent = e.message; }
+  };
+}
+
+// ================= start =================
+(async function init() {
+  try { me = await api("/me"); afterAuth(); } catch (e) { showLogin(); }
+})();
+</script>
+</body>
+</html>

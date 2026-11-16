@@ -123,15 +123,29 @@ ADMIN_PASSWORD = os.environ.get("DEPRESS_SENSE_ADMIN_PASSWORD")
 _admin_basic = HTTPBasic(auto_error=False)
 
 
-def require_admin(credentials: Optional[HTTPBasicCredentials] = Depends(_admin_basic)):
+def _is_local_direct_request(request: Request) -> bool:
+    """True tylko dla żądania prosto z tego samego komputera (loopback), BEZ pośrednika.
+    Na Railway ruch przychodzi przez proxy (adres klienta ≠ loopback, są nagłówki
+    X-Forwarded-*), więc tam to nigdy nie jest prawdą."""
+    host = request.client.host if request.client else ""
+    proxied = "x-forwarded-for" in request.headers or "x-forwarded-proto" in request.headers
+    return host in ("127.0.0.1", "::1", "localhost") and not proxied
+
+
+def require_admin(request: Request, credentials: Optional[HTTPBasicCredentials] = Depends(_admin_basic)):
     if not ADMIN_PASSWORD:
-        if PUBLIC_URL:
-            raise HTTPException(
-                503,
-                "Panel administratora jest wyłączony: ustaw zmienną środowiskową "
-                "DEPRESS_SENSE_ADMIN_PASSWORD na serwerze (Railway → Variables) i zrestartuj usługę.",
-            )
-        return
+        # Bez hasła panel jest otwarty WYŁĄCZNIE dla żądań z tego samego komputera
+        # (lokalne uruchomienie "Run" w IDE). Każde inne — w tym serwer na Railway,
+        # także gdy nie ustawiono DEPRESS_SENSE_PUBLIC_URL — jest odrzucane.
+        # (Wcześniej brak PUBLIC_URL traktowano jak "lokalnie" i panel był otwarty
+        # dla całego internetu.)
+        if _is_local_direct_request(request):
+            return
+        raise HTTPException(
+            503,
+            "Panel administratora jest wyłączony: ustaw zmienną środowiskową "
+            "DEPRESS_SENSE_ADMIN_PASSWORD na serwerze (Railway → Variables) i zrestartuj usługę.",
+        )
     ok = (
         credentials is not None
         and secrets.compare_digest(credentials.username.encode("utf-8"), ADMIN_USER.encode("utf-8"))
@@ -375,7 +389,8 @@ def init_db():
     # must_change_password=0, bo to konto deweloperskie, a nie realne konto badacza.
     # Na serwerze zewnętrznym (PUBLIC_URL) konto z publicznie znanym hasłem NIE jest już
     # tworzone domyślnie — chyba że jawnie ustawiono DEPRESS_SENSE_SEED_TEST_ACCOUNT=1.
-    if not PUBLIC_URL or os.environ.get("DEPRESS_SENSE_SEED_TEST_ACCOUNT") == "1":
+    if not (PUBLIC_URL or os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID")) \
+            or os.environ.get("DEPRESS_SENSE_SEED_TEST_ACCOUNT") == "1":
         cur.execute(
             "INSERT OR IGNORE INTO specialists (id, password, must_change_password) VALUES (?, ?, 0)",
             ("spec001", hash_password("test1234")),
@@ -2205,14 +2220,14 @@ _PANEL_CSS = r"""
   :root { color-scheme: light dark; }
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 0;
          background: #f4f5f7; color: #1a1a1a; }
-  .nav { background: #1a1a2e; padding: 0 24px; display: flex; align-items: center; gap: 4px; }
+  .nav { background: #0a5a62; padding: 0 24px; display: flex; align-items: center; gap: 4px; }
   .nav .brand { color: #7dd3fc; font-weight: 700; font-size: 14px; margin-right: 20px; padding: 14px 0; }
   .nav a { color: #ccc; text-decoration: none; font-size: 13px; padding: 14px 14px; border-bottom: 3px solid transparent; }
   .nav a:hover { color: white; }
   .nav a.active { color: white; border-bottom-color: #7dd3fc; }
   .page { padding: 24px; max-width: 1200px; margin: 0 auto; }
   h2 { font-size: 15px; margin: 0 0 4px; }
-  .banner { background: #1a1a2e; color: white; padding: 16px 20px; border-radius: 10px; margin-bottom: 24px; }
+  .banner { background: #0a5a62; color: white; padding: 16px 20px; border-radius: 10px; margin-bottom: 24px; }
   .banner .ip { font-family: ui-monospace, monospace; font-size: 22px; font-weight: 700; color: #7dd3fc; letter-spacing: 0.5px; }
   .banner .label { font-size: 12px; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; }
   section { margin-bottom: 28px; }
@@ -2239,7 +2254,7 @@ _PANEL_CSS = r"""
   .panel input, .toolbar input, .toolbar select, td select { padding: 7px 10px; font-size: 13px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; }
   .form-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
   .form-row input { flex: 1; min-width: 160px; }
-  button { background: #1a1a2e; color: white; border: none; padding: 8px 16px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+  button { background: #0a5a62; color: white; border: none; padding: 8px 16px; border-radius: 6px; font-size: 13px; cursor: pointer; }
   button:hover { background: #2a2a4a; }
   button.secondary { background: #eee; color: #333; }
   button.secondary:hover { background: #ddd; }
@@ -2257,7 +2272,7 @@ _PANEL_CSS = r"""
   .btn-warn:hover { background: #ffe0b2; }
   .tabs { display: flex; gap: 8px; margin-bottom: 20px; }
   .tab { background: white; color: #333; border: 1px solid #ddd; padding: 8px 18px; border-radius: 20px; font-size: 13px; cursor: pointer; }
-  .tab.active { background: #1a1a2e; color: white; border-color: #1a1a2e; }
+  .tab.active { background: #0a5a62; color: white; border-color: #0a5a62; }
   .toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
   .toolbar input { min-width: 240px; }
   .stats { display: flex; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
@@ -2632,6 +2647,14 @@ def admin_panel(request: Request):
     return _render_panel_page(
         "DEPRESS-SENSE — użytkownicy", "admin", _ADMIN_BODY, _ADMIN_JS, _public_server_url(request),
     )
+
+
+# ---------------------------------------------------------------------------
+# Portal WWW specjalisty (/specjalista) — patrz portal.py
+# ---------------------------------------------------------------------------
+import portal  # noqa: E402
+
+portal.setup(app, globals())
 
 
 # ---------------------------------------------------------------------------

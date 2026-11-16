@@ -276,7 +276,7 @@ Zmienne środowiskowe:
 
 | Zmienna | Znaczenie |
 |---|---|
-| `DEPRESS_SENSE_ADMIN_PASSWORD` | hasło administratora. **Na Railway obowiązkowe** — bez niego (przy ustawionym `DEPRESS_SENSE_PUBLIC_URL`) panele i endpointy administracyjne zwracają 503. Lokalnie, bez tej zmiennej, panel działa otwarcie jak dotąd. |
+| `DEPRESS_SENSE_ADMIN_PASSWORD` | hasło administratora. **Na Railway obowiązkowe** — bez niego panele i endpointy administracyjne zwracają 503. Bez tej zmiennej panele są **zamknięte** (503) dla każdego żądania, które nie jest bezpośrednim połączeniem z localhost — brak hasła nigdy nie oznacza otwartego dostępu. |
 | `DEPRESS_SENSE_ADMIN_USER` | login administratora (domyślnie `admin`) |
 | `DEPRESS_SENSE_SEED_TEST_ACCOUNT=1` | tworzy konto testowe `spec001`/`test1234` także na serwerze zewnętrznym (domyślnie tam NIE jest tworzone) |
 
@@ -286,3 +286,16 @@ logowaniu. Minimalna długość hasła: 8 znaków. Po 5 nieudanych próbach logo
 dane konto jest blokowane na resztę okna (429).
 
 `python main.py` (np. przycisk Run w IDE) uruchamia serwer tak samo jak komenda `uvicorn`.
+
+## Panel specjalisty WWW (aktualizacja 2026-11-16)
+
+`https://<twój-serwer>/specjalista` — to samo, co w aplikacji Specjalista (lista pacjentów, alerty
+PHQ-9 i zmiany zachowania, dodawanie pacjenta, MADRS, kontakt, edycja), plus wykresy:
+**zbiorcze** (średnie po wszystkich pacjentach, PHQ-9 każdego pacjenta, rozkład nasilenia,
+regularność samooceny) i **indywidualne** (aktywność, ekran, komunikacja, samoocena, PHQ-9/MADRS,
+wynik modelu zmian; okna 14/30/90 dni).
+
+Logowanie: ID specjalisty i hasło z aplikacji (wymuszona zmiana hasła działa tak samo). Sesja
+w ciasteczku HttpOnly/SameSite=Strict (8 h), nagłówek `X-Portal` jako ochrona CSRF, każdy
+specjalista widzi wyłącznie swoich pacjentów (cudzy → 404). Biblioteka wykresów jest
+serwowana z serwera (`static/chart.umd.js`) — brak zależności od CDN.
