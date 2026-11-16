@@ -30,7 +30,9 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi import Response
 
+import auth
 import push
+import research_export
 from pydantic import BaseModel, Field
 
 # Ścieżkę do pliku bazy można nadpisać zmienną środowiskową DEPRESS_SENSE_DB_PATH —
@@ -57,7 +59,8 @@ if _db_dir:
 # próbę otwarcia przeglądarki przy starcie (i tak by się nie udała bez GUI).
 PUBLIC_URL = os.environ.get("DEPRESS_SENSE_PUBLIC_URL") or os.environ.get("CHAD_SENCE_PUBLIC_URL")
 
-app = FastAPI(title="DEPRESS-SENSE Local Server")
+app = FastAPI(title="DEPRESS-SENSE Local Server", docs_url=None, redoc_url=None, openapi_url=None)  # bez publicznego opisu API
+app.middleware("http")(auth.auth_middleware)  # Faza 12: kto pyta i czy wolno mu to zobaczyć
 
 # Bufor logów żądań trzymany tylko w pamięci (nie w bazie) — to podgląd na żywo,
 # nie trwały log. Po restarcie serwera zawartość się czyści, co jest tu w porządku.
@@ -467,6 +470,7 @@ def _migrate_existing_columns():
 
 init_db()
 push.init(get_db)
+auth.init(get_db)
 
 
 def now_iso() -> str:
@@ -517,6 +521,27 @@ def get_local_ip() -> str:
 # realny identyfikator urządzenia w sieci używamy adresu IP (widzianego bezpośrednio
 # przez serwer z połączenia TCP — to jest zawsze prawdziwe) oraz Device ID.
 
+def mask_ip(ip: str) -> str:
+    """Pseudonimizacja adresu IP w logach/urządzeniach: IPv4 → ostatni oktet zamazany
+    (192.168.1.x), IPv6 → tylko pierwsze 3 grupy. Do diagnostyki sieci wystarcza, a pełny
+    adres nie jest przechowywany."""
+    if not ip or ip == "?":
+        return ip
+    if ":" in ip and not ip.replace(".", "").isdigit():
+        parts = ip.split(":")
+        return ":".join(parts[:3]) + "::x"
+    parts = ip.split(".")
+    return ".".join(parts[:3] + ["x"]) if len(parts) == 4 else ip
+
+
+_PATIENT_PATH_RE = __import__("re").compile(r"(/patients/)([^/]+)")
+
+
+def mask_path(path: str) -> str:
+    """W logach ścieżki typu /patients/<UUID>/data skracamy do /patients/<6 znaków>…/data."""
+    return _PATIENT_PATH_RE.sub(lambda m: m.group(1) + (m.group(2)[:6] + "…" if len(m.group(2)) > 6 else m.group(2)), path)
+
+
 def track_device(request: Request):
     device_id = request.headers.get("X-Device-Id")
     if not device_id:
@@ -525,7 +550,7 @@ def track_device(request: Request):
     role = request.headers.get("X-Device-Role", "?")
     model = request.headers.get("X-Device-Model", "?")
     mac = request.headers.get("X-Device-Mac") or "niedostępny (ograniczenie systemu Android)"
-    ip = request.client.host if request.client else "?"
+    ip = mask_ip(request.client.host if request.client else "?")
     ts = now_iso()
 
     conn = get_db()
@@ -539,7 +564,7 @@ def track_device(request: Request):
                ip_address = excluded.ip_address,
                last_endpoint = excluded.last_endpoint,
                last_seen = excluded.last_seen""",
-        (device_id, role, model, mac, ip, f"{request.method} {request.url.path}", ts, ts),
+        (device_id, role, model, mac, ip, f"{request.method} {mask_path(request.url.path)}", ts, ts),
     )
     conn.commit()
     conn.close()
@@ -570,9 +595,9 @@ async def access_log_middleware(request: Request, call_next):
         LOG_BUFFER.appendleft({
             "time": now_iso(),
             "method": request.method,
-            "path": request.url.path,
+            "path": mask_path(request.url.path),
             "status": status_code,
-            "ip": request.client.host if request.client else "?",
+            "ip": mask_ip(request.client.host if request.client else "?"),
             "duration_ms": duration_ms,
         })
 
@@ -688,7 +713,10 @@ class CaregiverAddRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 @app.post("/patients/register")
-def register_patient(req: RegisterPatientRequest):
+def register_patient(req: RegisterPatientRequest, request: Request):
+    principal = getattr(request.state, "principal", None)
+    if principal is not None and principal.subject != req.patient_id:
+        raise HTTPException(403, "ID pacjenta nie zgadza się z urządzeniem")
     conn = get_db()
     conn.execute(
         "INSERT OR IGNORE INTO patients (id, name, last_sync) VALUES (?, ?, ?)",
@@ -1750,6 +1778,11 @@ def _maybe_open_dashboard_in_browser():
 
 @app.on_event("startup")
 async def on_startup():
+    gaps = auth.check_coverage(app)
+    if gaps:
+        print(f"[auth] UWAGA: trasy mobilne bez reguły dostępu: {gaps}")
+    if not auth.ENFORCE:
+        print("[auth] UWAGA: DEPRESS_SENSE_AUTH_ENFORCE=0 — uwierzytelnianie apek NIE jest wymuszane")
     _maybe_open_dashboard_in_browser()
     asyncio.create_task(_background_stats_refresher())
     asyncio.create_task(_background_push_checker())
@@ -1844,7 +1877,18 @@ def specialist_login(req: LoginRequest):
         "status": "ok",
         "specialist_id": row["id"],
         "must_change_password": bool(row["must_change_password"]),
+        # token sesji — apka wysyła go w nagłówku Authorization: Bearer przy każdym żądaniu
+        "token": auth.create_session(row["id"]),
     }
+
+
+@app.post("/specialists/logout")
+def specialist_logout(request: Request):
+    """Unieważnia token sesji tej apki (np. po 5 błędnych próbach PIN-u albo wylogowaniu)."""
+    header = request.headers.get("authorization", "")
+    if header.lower().startswith("bearer "):
+        auth.delete_session(header[7:].strip())
+    return {"status": "ok"}
 
 
 @app.post("/specialists/change-password")
@@ -1941,6 +1985,7 @@ def delete_specialist(specialist_id: str):
     conn.execute("DELETE FROM specialists WHERE id = ?", (row["id"],))
     conn.commit()
     conn.close()
+    auth.delete_sessions_for(row["id"])
     return {"status": "ok"}
 
 
@@ -1957,6 +2002,7 @@ def force_password_change(specialist_id: str):
     conn.execute("UPDATE specialists SET must_change_password = 1 WHERE id = ?", (row["id"],))
     conn.commit()
     conn.close()
+    auth.delete_sessions_for(row["id"])  # wyloguj z apek — wrócą przez logowanie i zmianę hasła
     return {"status": "ok"}
 
 
@@ -2058,10 +2104,20 @@ class PushUnregisterRequest(BaseModel):
 
 
 @app.post("/push/register")
-def push_register(req: PushRegisterRequest):
+def push_register(req: PushRegisterRequest, request: Request):
     """Apka zgłasza swój token FCM (po instalacji, po zmianie tokenu, po zalogowaniu).
     Rola: pacjent (user_id = id pacjenta), specjalista (id specjalisty), opiekun (id
     podopiecznego). Uwaga: jak pozostałe endpointy apek — bez uwierzytelnienia (Faza 12)."""
+    p = getattr(request.state, "principal", None)
+    if p is not None:
+        # można zgłosić token tylko dla siebie (pacjent: własne id, specjalista: własne id,
+        # opiekun: pacjent, z którym jest powiązany)
+        ok = p.role == req.role and (
+            p.subject == req.user_id if req.role in ("pacjent", "specjalista") else
+            auth._caregiver_linked(get_db(), p.subject, req.user_id)
+        )
+        if not ok:
+            raise HTTPException(403, "Nie można rejestrować push dla innego użytkownika")
     try:
         push.register_token(req.role, req.user_id.strip(), req.token.strip())
     except ValueError:
@@ -2160,7 +2216,10 @@ def specialist_contact_patient(patient_id: str):
 # ---------------------------------------------------------------------------
 
 @app.post("/caregivers/add")
-def caregiver_add_patient(req: CaregiverAddRequest):
+def caregiver_add_patient(req: CaregiverAddRequest, request: Request):
+    principal = getattr(request.state, "principal", None)
+    if principal is not None and principal.subject != req.caregiver_device_id:
+        raise HTTPException(403, "Identyfikator urządzenia nie zgadza się z tokenem")
     conn = get_db()
     patient = conn.execute("SELECT caregiver_slots FROM patients WHERE id = ?", (req.patient_id,)).fetchone()
     if not patient:
@@ -2302,6 +2361,7 @@ def admin_reset_specialist_password(specialist_id: str, req: ResetPasswordReques
     conn.commit()
     conn.close()
     _LOGIN_FAILS.pop(_login_key(row["id"]), None)
+    auth.delete_sessions_for(row["id"])
     return {"status": "ok"}
 
 
@@ -2552,6 +2612,15 @@ _ADMIN_BODY = r"""
   </div>
 
   <div id="tab-patients" style="display:none">
+    <section>
+      <h2>Eksport badawczy (pseudonimizowany)</h2>
+      <div class="sub">Paczka danych (ZIP z CSV) bez imion, ID i dat kalendarzowych oraz osobny plik klucza (kod ↔ ID/nazwa).
+        <b>Nie przechowuj ich razem.</b> Wymaga ustawionej zmiennej <code>DEPRESS_SENSE_PSEUDONYM_KEY</code> na serwerze.</div>
+      <div class="panel"><div class="form-row">
+        <a href="/admin/export/research.zip"><button type="button">Pobierz dane (ZIP)</button></a>
+        <a href="/admin/export/key.csv"><button class="secondary" type="button">Pobierz plik klucza (CSV)</button></a>
+      </div></div>
+    </section>
     <section>
       <h2>Pacjenci</h2>
       <div class="sub">Wszyscy zarejestrowani uczestnicy. „Oczekuje” = jeszcze nieprzypisany do żadnego specjalisty — apka pacjenta nie wysyła wtedy danych.
@@ -2847,6 +2916,23 @@ def admin_panel(request: Request):
 # ---------------------------------------------------------------------------
 # Portal WWW specjalisty (/specjalista) — patrz portal.py
 # ---------------------------------------------------------------------------
+research_export.setup(app, get_db, require_admin)
+
+
+def _mask_existing_device_rows():
+    """Jednorazowo (i przy każdym starcie, idempotentnie) maskuje IP i ścieżki zapisane
+    w tabeli devices przed wprowadzeniem pseudonimizacji."""
+    conn = get_db()
+    for r in conn.execute("SELECT device_id, ip_address, last_endpoint FROM devices").fetchall():
+        ip, ep = mask_ip(r["ip_address"] or ""), mask_path(r["last_endpoint"] or "")
+        if ip != r["ip_address"] or ep != r["last_endpoint"]:
+            conn.execute("UPDATE devices SET ip_address = ?, last_endpoint = ? WHERE device_id = ?", (ip, ep, r["device_id"]))
+    conn.commit()
+    conn.close()
+
+
+_mask_existing_device_rows()
+
 import portal  # noqa: E402
 
 portal.setup(app, globals())
