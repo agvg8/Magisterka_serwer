@@ -299,3 +299,11 @@ Logowanie: ID specjalisty i hasło z aplikacji (wymuszona zmiana hasła działa 
 w ciasteczku HttpOnly/SameSite=Strict (8 h), nagłówek `X-Portal` jako ochrona CSRF, każdy
 specjalista widzi wyłącznie swoich pacjentów (cudzy → 404). Biblioteka wykresów jest
 serwowana z serwera (`static/chart.umd.js`) — brak zależności od CDN.
+
+### Logowanie i wylogowanie (aktualizacja 2026-11-16, wieczór)
+
+HTTP Basic zastąpiono formularzem `/admin/login` (przeglądarka nie „zapamiętuje” już hasła, a
+Basic nie dało się wylogować). Sesja administratora: ciasteczko sesyjne (znika po zamknięciu
+przeglądarki), wygasa po 15 min bezczynności, przycisk **Wyloguj** w pasku `/admin` i `/dashboard`
+unieważnia ją na serwerze. Panel specjalisty `/specjalista`: sesja wygasa po 30 min bezczynności,
+też bez trwałego ciasteczka; pola logowania mają wyłączone podpowiadanie haseł.

@@ -28,7 +28,7 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi import Response
 from pydantic import BaseModel, Field
 
 # Ścieżkę do pliku bazy można nadpisać zmienną środowiskową DEPRESS_SENSE_DB_PATH —
@@ -120,7 +120,12 @@ def is_hashed(stored: str) -> bool:
 # dla każdego, kto zna adres serwera.
 ADMIN_USER = os.environ.get("DEPRESS_SENSE_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.environ.get("DEPRESS_SENSE_ADMIN_PASSWORD")
-_admin_basic = HTTPBasic(auto_error=False)
+# Sesja administratora: formularz logowania + ciasteczko SESYJNE (znika po zamknięciu
+# przeglądarki, nie jest "zapamiętywane" jak HTTP Basic), wygasa po 15 min bezczynności,
+# jest unieważniane przyciskiem "Wyloguj". Hasło trzeba więc podać za każdym razem.
+ADMIN_COOKIE = "ds_admin"
+ADMIN_IDLE_SECONDS = 15 * 60
+_ADMIN_SESSIONS: dict = {}  # token -> ostatnia aktywność (time.time())
 
 
 def _is_local_direct_request(request: Request) -> bool:
@@ -132,13 +137,23 @@ def _is_local_direct_request(request: Request) -> bool:
     return host in ("127.0.0.1", "::1", "localhost") and not proxied
 
 
-def require_admin(request: Request, credentials: Optional[HTTPBasicCredentials] = Depends(_admin_basic)):
+def _admin_session_valid(request: Request) -> bool:
+    token = request.cookies.get(ADMIN_COOKIE)
+    last = _ADMIN_SESSIONS.get(token) if token else None
+    if last is None:
+        return False
+    now = time.time()
+    if now - last > ADMIN_IDLE_SECONDS:
+        _ADMIN_SESSIONS.pop(token, None)
+        return False
+    _ADMIN_SESSIONS[token] = now
+    return True
+
+
+def require_admin(request: Request):
     if not ADMIN_PASSWORD:
         # Bez hasła panel jest otwarty WYŁĄCZNIE dla żądań z tego samego komputera
-        # (lokalne uruchomienie "Run" w IDE). Każde inne — w tym serwer na Railway,
-        # także gdy nie ustawiono DEPRESS_SENSE_PUBLIC_URL — jest odrzucane.
-        # (Wcześniej brak PUBLIC_URL traktowano jak "lokalnie" i panel był otwarty
-        # dla całego internetu.)
+        # (lokalne uruchomienie "Run" w IDE). Każde inne jest odrzucane.
         if _is_local_direct_request(request):
             return
         raise HTTPException(
@@ -146,16 +161,14 @@ def require_admin(request: Request, credentials: Optional[HTTPBasicCredentials] 
             "Panel administratora jest wyłączony: ustaw zmienną środowiskową "
             "DEPRESS_SENSE_ADMIN_PASSWORD na serwerze (Railway → Variables) i zrestartuj usługę.",
         )
-    ok = (
-        credentials is not None
-        and secrets.compare_digest(credentials.username.encode("utf-8"), ADMIN_USER.encode("utf-8"))
-        and secrets.compare_digest(credentials.password.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8"))
-    )
-    if not ok:
-        raise HTTPException(
-            401, "Wymagane logowanie administratora",
-            headers={"WWW-Authenticate": 'Basic realm="DEPRESS-SENSE admin", charset="UTF-8"'},
-        )
+    if _admin_session_valid(request):
+        # Ochrona CSRF dla zmian: ciasteczko SameSite=Strict + wymagany własny nagłówek.
+        if request.method not in ("GET", "HEAD") and request.headers.get("x-admin") != "1":
+            raise HTTPException(403, "Brak nagłówka X-Admin")
+        return
+    if request.method == "GET" and "text/html" in request.headers.get("accept", ""):
+        raise HTTPException(303, "Zaloguj się", headers={"Location": "/admin/login"})
+    raise HTTPException(401, "Wymagane logowanie administratora")
 
 
 # Ograniczenie prób zgadywania hasła specjalisty: po 5 nieudanych próbach w ciągu
@@ -2225,6 +2238,7 @@ _PANEL_CSS = r"""
   .nav a { color: #ccc; text-decoration: none; font-size: 13px; padding: 14px 14px; border-bottom: 3px solid transparent; }
   .nav a:hover { color: white; }
   .nav a.active { color: white; border-bottom-color: #7dd3fc; }
+  .nav .logout { margin-left: auto; background: transparent; border: 1px solid #7dd3fc; color: #e0f7fa; padding: 6px 14px; }
   .page { padding: 24px; max-width: 1200px; margin: 0 auto; }
   h2 { font-size: 15px; margin: 0 0 4px; }
   .banner { background: #0a5a62; color: white; padding: 16px 20px; border-radius: 10px; margin-bottom: 24px; }
@@ -2303,6 +2317,10 @@ function fmtDateTime(iso) {
   if (!iso) return "—";
   return new Date(iso).toLocaleString("pl-PL");
 }
+async function adminLogout() {
+  try { await fetch("/admin/logout", { method: "POST", headers: { "X-Admin": "1" } }); } catch (e) {}
+  location.href = "/admin/login";
+}
 """
 
 
@@ -2310,7 +2328,9 @@ def _render_panel_page(title: str, active: str, body: str, script: str, server_u
     nav = (
         '<div class="nav"><span class="brand">DEPRESS-SENSE</span>'
         f'<a href="/dashboard" class="{"active" if active == "dashboard" else ""}">Monitoring serwera</a>'
-        f'<a href="/admin" class="{"active" if active == "admin" else ""}">Użytkownicy</a></div>'
+        f'<a href="/admin" class="{"active" if active == "admin" else ""}">Użytkownicy</a>'
+        + ('<button class="logout" onclick="adminLogout()">Wyloguj</button>' if ADMIN_PASSWORD else "")
+        + '</div>'
     )
     return (
         '<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8">'
@@ -2447,10 +2467,11 @@ let patients = [];
 const openCaregivers = new Set();
 
 async function call(method, path, body) {
-  const opts = { method, headers: {} };
+  const opts = { method, headers: { "X-Admin": "1" } };
   if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
   try {
     const resp = await fetch(path, opts);
+    if (resp.status === 401) { location.href = "/admin/login"; }
     let data = null;
     try { data = await resp.json(); } catch (e) {}
     return { ok: resp.ok, status: resp.status, data };
@@ -2629,6 +2650,70 @@ setInterval(() => {
   refreshPatients(); refreshSpecialists();
 }, 15000);
 """
+
+
+_ADMIN_LOGIN_HTML = """<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><title>Logowanie administratora</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f3f7f9;font-family:system-ui,Segoe UI,sans-serif;color:#16323a}
+form{background:#fff;padding:32px;border-radius:16px;width:100%;max-width:360px;box-shadow:0 4px 18px rgba(0,0,0,.08);border-top:5px solid #0e7c86}
+h1{font-size:19px;margin:0 0 18px;color:#0a5a62}label{display:block;font-size:12px;font-weight:600;color:#5f7780;margin-bottom:14px}
+input{display:block;width:100%;box-sizing:border-box;margin-top:5px;padding:10px 12px;border:1px solid #e1eaee;border-radius:10px;font:inherit}
+button{width:100%;padding:11px;border:0;border-radius:10px;background:#0e7c86;color:#fff;font:inherit;font-weight:600;cursor:pointer}
+.err{color:#d64545;font-size:13px;min-height:18px;margin-bottom:8px}</style></head><body>
+<form id="f" autocomplete="off"><h1>✚ DEPRESS-SENSE — administrator</h1>
+<label>Login<input id="u" name="u" autocomplete="off" required></label>
+<label>Hasło<input id="p" name="p" type="password" autocomplete="new-password" required></label>
+<div class="err" id="e"></div><button>Zaloguj</button></form>
+<script>document.getElementById("f").onsubmit=async ev=>{ev.preventDefault();
+const r=await fetch("/admin/login",{method:"POST",headers:{"Content-Type":"application/json","X-Admin":"1"},
+body:JSON.stringify({username:u.value,password:p.value})});
+if(r.ok){location.href="/admin";}else{let d={};try{d=await r.json()}catch(x){}e.textContent=d.detail||"Błąd logowania";p.value="";}};</script></body></html>"""
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.get("/admin/login", response_class=HTMLResponse)
+def admin_login_page():
+    return HTMLResponse(_ADMIN_LOGIN_HTML, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/admin/login")
+def admin_login(req: AdminLoginRequest, request: Request, response: Response):
+    if request.headers.get("x-admin") != "1":
+        raise HTTPException(403, "Brak nagłówka X-Admin")
+    if not ADMIN_PASSWORD:
+        raise HTTPException(503, "Hasło administratora nie jest ustawione na serwerze (DEPRESS_SENSE_ADMIN_PASSWORD).")
+    key = "__admin__"
+    _check_login_throttle(key)
+    ok = secrets.compare_digest(req.username.encode("utf-8"), ADMIN_USER.encode("utf-8")) and \
+        secrets.compare_digest(req.password.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8"))
+    if not ok:
+        _register_login_failure(key)
+        raise HTTPException(401, "Błędny login lub hasło")
+    _LOGIN_FAILS.pop(key, None)
+    token = secrets.token_urlsafe(32)
+    _ADMIN_SESSIONS[token] = time.time()
+    # bez max_age => ciasteczko sesyjne (znika po zamknięciu przeglądarki)
+    response.set_cookie(
+        ADMIN_COOKIE, token, httponly=True, samesite="strict", path="/",
+        secure=request.headers.get("x-forwarded-proto", request.url.scheme) == "https",
+    )
+    return {"status": "ok"}
+
+
+@app.post("/admin/logout")
+def admin_logout(request: Request, response: Response):
+    if request.headers.get("x-admin") != "1":
+        raise HTTPException(403, "Brak nagłówka X-Admin")
+    token = request.cookies.get(ADMIN_COOKIE)
+    if token:
+        _ADMIN_SESSIONS.pop(token, None)
+    response.delete_cookie(ADMIN_COOKIE, path="/")
+    return {"status": "ok"}
+
 
 
 @app.get("/dashboard", response_class=HTMLResponse, dependencies=[Depends(require_admin)])

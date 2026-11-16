@@ -138,11 +138,11 @@
 
 <!-- ============ LOGOWANIE ============ -->
 <div id="view-login" class="auth-wrap hidden">
-  <form class="auth-card" id="login-form" autocomplete="on">
+  <form class="auth-card" id="login-form" autocomplete="off">
     <div class="brand"><span class="logo">✚</span> DEPRESS-SENSE</div>
     <p class="lead">Panel specjalisty — zaloguj się kontem, którego używasz w aplikacji Specjalista.</p>
-    <label class="field">Login (ID specjalisty)<input id="login-id" type="text" autocomplete="username" required></label>
-    <label class="field">Hasło<input id="login-password" type="password" autocomplete="current-password" required></label>
+    <label class="field">Login (ID specjalisty)<input id="login-id" type="text" autocomplete="off" required></label>
+    <label class="field">Hasło<input id="login-password" type="password" autocomplete="new-password" required></label>
     <div class="form-error" id="login-error"></div>
     <button class="btn block" type="submit">Zaloguj się</button>
   </form>
@@ -153,7 +153,7 @@
   <form class="auth-card" id="password-form">
     <div class="brand"><span class="logo">✚</span> DEPRESS-SENSE</div>
     <p class="lead">To Twoje pierwsze logowanie (albo administrator wymusił zmianę). Ustaw własne hasło — min. 8 znaków.</p>
-    <label class="field">Obecne hasło<input id="pw-old" type="password" autocomplete="current-password" required></label>
+    <label class="field">Obecne hasło<input id="pw-old" type="password" autocomplete="new-password" required></label>
     <label class="field">Nowe hasło<input id="pw-new" type="password" autocomplete="new-password" required></label>
     <label class="field">Powtórz nowe hasło<input id="pw-new2" type="password" autocomplete="new-password" required></label>
     <div class="form-error" id="pw-error"></div>
@@ -268,7 +268,7 @@ let overviewCache = null;
 function showView(name) {
   for (const v of ["login", "password", "app"]) $("#view-" + v).classList.toggle("hidden", v !== name);
 }
-function showLogin() { destroyCharts(); me = null; showView("login"); $("#login-password").value = ""; }
+function showLogin() { destroyCharts(); me = null; overviewCache = null; history.replaceState(null, "", location.pathname); showView("login"); $("#login-id").value = ""; $("#login-password").value = ""; }
 
 function route() {
   const hash = location.hash.replace(/^#\/?/, "");

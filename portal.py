@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 SESSION_COOKIE = "ds_session"
-SESSION_TTL_SECONDS = 8 * 3600
+SESSION_TTL_SECONDS = 30 * 60  # bezczynność; ciasteczko sesyjne, hasło podaje się przy każdym wejściu
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 # token -> {"specialist_id", "must_change", "expires"} — w pamięci procesu (restart serwera
@@ -90,6 +90,7 @@ def setup(app, ns: dict):
         if sess["expires"] < time.time():
             _SESSIONS.pop(token, None)
             return None
+        sess["expires"] = time.time() + SESSION_TTL_SECONDS  # wygasa po bezczynności
         return sess
 
     def _guard_csrf(request: Request):
@@ -149,7 +150,7 @@ def setup(app, ns: dict):
             "expires": time.time() + SESSION_TTL_SECONDS,
         }
         response.set_cookie(
-            SESSION_COOKIE, token, max_age=SESSION_TTL_SECONDS, httponly=True,
+            SESSION_COOKIE, token, httponly=True,
             samesite="strict", secure=_is_https(request), path="/",
         )
         return {"specialist_id": row["id"], "must_change_password": bool(row["must_change_password"])}
